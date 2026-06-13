@@ -16,7 +16,10 @@ LOG=/tmp/$NAME.log
 
 start() {
     echo "Starting $NAME"
-    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- -config "$CONFIG" >>"$LOG" 2>&1
+    # Wrap in `sh -c exec` so the daemon inherits the log redirect (start-stop-daemon
+    # -b otherwise sends the child's stdio to /dev/null). exec makes the pidfile
+    # point at the daemon itself.
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c "exec $DAEMON -config $CONFIG >>$LOG 2>&1"
 }
 
 stop() {
