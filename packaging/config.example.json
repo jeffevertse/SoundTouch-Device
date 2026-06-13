@@ -1,0 +1,13 @@
+{
+  "device_host": "",
+  "proxy_port": 8091,
+  "last_preset_id": 0,
+  "presets": [
+    { "id": 1, "name": "BBC Radio 4", "stream_url": "http://stream.live.vc.bbcmedia.co.uk/bbc_radio_four_fm", "icon": "📻" },
+    { "id": 2, "name": "BBC Radio 6 Music", "stream_url": "http://stream.live.vc.bbcmedia.co.uk/bbc_6music", "icon": "🎵" },
+    { "id": 3, "name": "NTS Radio 1", "stream_url": "https://stream-relay-geo.ntslive.net/stream", "icon": "🎶" },
+    { "id": 4, "name": "KEXP Seattle", "stream_url": "https://kexp-mp3-128.streamguys1.com/kexp128.mp3", "icon": "🌲" },
+    { "id": 5, "name": "Jazz24", "stream_url": "https://live.jazz24.org/jazz24", "icon": "🎷" },
+    { "id": 6, "name": "Empty Preset 6", "stream_url": "", "icon": "⭕" }
+  ]
+}

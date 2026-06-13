@@ -1,0 +1,4 @@
+github.com/gesellix/bose-soundtouch v0.112.0 h1:RCGbpsJjfaNhSITFf7ocigWyeK97Bi9sH4t9ol1/Q70=
+github.com/gesellix/bose-soundtouch v0.112.0/go.mod h1:u0pFS8pV9u8dXli8l/3QDWs952Y/pdPoOUPedk99zQ4=
+github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
+github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=

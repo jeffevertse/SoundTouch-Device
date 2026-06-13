@@ -1,0 +1,8 @@
+# build output
+dist/
+
+# Phase-0 device snapshots (may contain device config)
+backup/
+
+*.log
+.DS_Store
