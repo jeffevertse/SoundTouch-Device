@@ -52,6 +52,43 @@ This project is **additive** — it adds files under `/mnt/nv/soundtouchd/`, an
 `/etc/init.d/soundtouchd` service, and an `/opt/soundtouchd` symlink. It does **not**
 modify any Bose configuration, so `make uninstall` returns the device to stock.
 
+## Usage
+
+The service listens on **port 8099** (set `proxy_port` in the config to change it). Call it from any
+device on your LAN, or from the speaker itself via `127.0.0.1`. Replace `<speaker-ip>` with e.g.
+`192.168.1.29`.
+
+| Method | Endpoint        | Purpose                                                            |
+| ------ | --------------- | ----------------------------------------------------------------- |
+| GET    | `/play/<id>`    | Play preset `<id>` (1–6). Returns `{"ok":true,"preset":<id>}`.     |
+| GET    | `/stream/<id>`  | Audio proxy for preset `<id>` — the speaker fetches this, not you. |
+| GET    | `/status`       | Current now-playing (JSON, from the speaker's own API).           |
+| GET    | `/healthz`      | Liveness: `{"ok":true,"version":"…","rendererReady":<bool>}`.      |
+
+```sh
+# play a preset
+curl http://<speaker-ip>:8099/play/1     # BBC Radio 4
+curl http://<speaker-ip>:8099/play/5     # Jazz24
+
+# check state
+curl http://<speaker-ip>:8099/healthz
+curl http://<speaker-ip>:8099/status
+```
+
+The last station played is remembered and **auto-resumes when the speaker powers on**.
+
+### Editing stations
+
+Presets live in `/mnt/nv/soundtouchd/config.json` on the speaker — edit over SSH and restart:
+
+```sh
+ssh -o HostKeyAlgorithms=+ssh-rsa root@<speaker-ip>
+vi /mnt/nv/soundtouchd/config.json       # set name / stream_url / icon per preset (ids 1–6)
+/etc/init.d/soundtouchd restart
+```
+
+Use any public MP3/AAC stream URL, or a `.pls`/`.m3u` playlist; HTTPS is downgraded automatically.
+
 ## Constraints & risks
 
 - `/mnt/nv` is tiny (~20–40 MB); the installer backs up + garbage-collects and prints `df`.
