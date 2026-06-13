@@ -77,7 +77,21 @@ curl http://<speaker-ip>:8099/status
 
 The last station played is remembered and **auto-resumes when the speaker powers on**.
 
-### Editing stations
+### Config editor (local HTML)
+
+`editor/config-editor.html` is a self-contained page (no dependencies) for editing presets without
+SSH. Open it in a browser, enter the speaker's IP (and port `8099`), click **Load**, edit the
+presets, then **Save & Apply** — changes take effect immediately. Use **Restart service** only after
+changing `proxy_port`.
+
+```sh
+open editor/config-editor.html        # macOS — or just double-click the file
+```
+
+It talks to the daemon's `/config` API over your LAN. CORS is restricted to `file://`/localhost/
+private-network origins, so a random public website can't reach your speaker.
+
+### Editing stations (SSH)
 
 Presets live in `/mnt/nv/soundtouchd/config.json` on the speaker — edit over SSH and restart:
 

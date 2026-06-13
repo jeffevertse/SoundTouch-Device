@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SoundTouch · Config editor</title>
+<style>
+  :root { --bg:#f5f5f7; --card:#fff; --line:#d2d2d7; --accent:#0a84ff; --green:#34c759; --red:#ff3b30; --muted:#6e6e73; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:#1d1d1f; }
+  .wrap { max-width:760px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  label { display:block; font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; margin:0 0 4px; }
+  input, textarea { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; }
+  input:focus, textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(10,132,255,.15); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:120px; }
+  .conn { display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
+  .conn > div { flex:1; min-width:120px; }
+  button { font:inherit; font-weight:600; padding:10px 16px; border:none; border-radius:8px; cursor:pointer; }
+  .btn { background:var(--accent); color:#fff; } .btn:active{filter:brightness(.9);}
+  .btn.secondary { background:#e8e8ed; color:#1d1d1f; }
+  .btn.danger { background:#ffe5e3; color:var(--red); }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .preset { border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:10px; }
+  .preset h3 { margin:0 0 8px; font-size:13px; color:var(--muted); }
+  .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; }
+  .status { padding:11px 14px; border-radius:8px; margin-bottom:16px; display:none; white-space:pre-wrap; }
+  .status.show { display:block; }
+  .status.ok { background:rgba(52,199,89,.12); color:#1c7a33; border:1px solid var(--green); }
+  .status.err { background:rgba(255,59,48,.10); color:#b3261e; border:1px solid var(--red); }
+  .status.info { background:#eef; color:#3a3a8a; border:1px solid #ccd; }
+  details { margin-top:8px; } summary { cursor:pointer; color:var(--accent); font-weight:600; }
+  textarea { min-height:220px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; margin-top:8px; }
+  .muted { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SoundTouch config editor</h1>
+  <p class="sub">Edit the on-device presets and apply them — no SSH needed.</p>
+
+  <div id="status" class="status"></div>
+
+  <div class="card">
+    <div class="conn">
+      <div><label>Device IP / host</label><input id="host" placeholder="192.168.1.29"></div>
+      <div style="max-width:110px"><label>Port</label><input id="port" placeholder="8099"></div>
+      <button class="btn" id="loadBtn" onclick="load()">Load</button>
+    </div>
+    <p class="muted" style="margin:10px 0 0">Tip: this is the SoundTouch's own IP and the soundtouchd port (default 8099).</p>
+  </div>
+
+  <div id="editor" style="display:none">
+    <div class="card">
+      <div id="presets"></div>
+    </div>
+
+    <div class="card">
+      <label>Advanced</label>
+      <div class="row">
+        <div><label>proxy_port</label><input id="proxyPort"></div>
+        <div><label>device_host</label><input id="deviceHost" placeholder="(blank = this device)"></div>
+      </div>
+      <details>
+        <summary>Raw JSON</summary>
+        <textarea id="raw" spellcheck="false"></textarea>
+        <div class="actions"><button class="btn secondary" onclick="applyRaw()">Apply raw JSON</button></div>
+      </details>
+    </div>
+
+    <div class="actions">
+      <button class="btn" onclick="save()">Save &amp; Apply</button>
+      <button class="btn danger" onclick="restart()">Restart service</button>
+    </div>
+    <p class="muted" style="margin-top:10px">Save &amp; Apply takes effect instantly. Use Restart only after changing the port.</p>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastPresetId = 0;
+
+// persist connection
+$("host").value = localStorage.getItem("st_host") || "192.168.1.29";
+$("port").value = localStorage.getItem("st_port") || "8099";
+
+function base() {
+  const h = $("host").value.trim(), p = ($("port").value.trim() || "8099");
+  localStorage.setItem("st_host", h); localStorage.setItem("st_port", p);
+  return `http://${h}:${p}`;
+}
+function status(msg, kind) {
+  const el = $("status"); el.textContent = msg; el.className = "status show " + (kind || "info");
+}
+
+async function load() {
+  if (!$("host").value.trim()) { status("Enter the device IP first.", "err"); return; }
+  status("Loading…", "info");
+  try {
+    const r = await fetch(base() + "/config");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const cfg = await r.json();
+    fillForm(cfg);
+    $("editor").style.display = "";
+    status("Loaded current config.", "ok");
+  } catch (e) {
+    status("Couldn't reach the device: " + e.message +
+      "\nCheck the IP/port and that the SoundTouch add-on is running.", "err");
+  }
+}
+
+function fillForm(cfg) {
+  lastPresetId = cfg.last_preset_id || 0;
+  $("proxyPort").value = cfg.proxy_port ?? 8099;
+  $("deviceHost").value = cfg.device_host || "";
+  const byId = {};
+  (cfg.presets || []).forEach(p => byId[p.id] = p);
+  const c = $("presets"); c.innerHTML = "";
+  for (let id = 1; id <= 6; id++) {
+    const p = byId[id] || { id, name: "", stream_url: "", icon: "" };
+    const div = document.createElement("div");
+    div.className = "preset";
+    div.innerHTML = `<h3>Preset ${id}</h3>
+      <div class="row">
+        <div style="flex:0 0 70px"><label>Icon</label><input data-f="icon" data-id="${id}" value="${esc(p.icon)}" maxlength="4"></div>
+        <div style="flex:2"><label>Name</label><input data-f="name" data-id="${id}" value="${esc(p.name)}"></div>
+      </div>
+      <div style="margin-top:8px"><label>Stream URL</label><input data-f="stream_url" data-id="${id}" value="${esc(p.stream_url)}" placeholder="http(s)://… .mp3 / .pls / .m3u"></div>`;
+    c.appendChild(div);
+  }
+  $("raw").value = JSON.stringify(buildConfig(), null, 2);
+}
+
+function buildConfig() {
+  const presets = [];
+  for (let id = 1; id <= 6; id++) {
+    const g = (f) => (document.querySelector(`[data-f="${f}"][data-id="${id}"]`)?.value || "").trim();
+    presets.push({ id, name: g("name"), stream_url: g("stream_url"), icon: g("icon") });
+  }
+  return {
+    device_host: $("deviceHost").value.trim(),
+    proxy_port: parseInt($("proxyPort").value, 10) || 8099,
+    last_preset_id: lastPresetId,
+    presets,
+  };
+}
+
+function esc(s) { return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;"); }
+
+async function postConfig(cfg) {
+  const r = await fetch(base() + "/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cfg),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(text || ("HTTP " + r.status));
+  return JSON.parse(text);
+}
+
+async function save() {
+  const cfg = buildConfig();
+  $("raw").value = JSON.stringify(cfg, null, 2);
+  status("Saving…", "info");
+  try {
+    const res = await postConfig(cfg);
+    status("Saved and applied ✓" + (res.restartNeeded ? "\nPort changed — click Restart service to apply it." : ""), "ok");
+  } catch (e) { status("Save failed: " + e.message, "err"); }
+}
+
+async function applyRaw() {
+  let cfg;
+  try { cfg = JSON.parse($("raw").value); }
+  catch (e) { status("Raw JSON is invalid: " + e.message, "err"); return; }
+  status("Applying raw JSON…", "info");
+  try {
+    const res = await postConfig(cfg);
+    fillForm(cfg);
+    status("Applied raw JSON ✓" + (res.restartNeeded ? "\nPort changed — click Restart service." : ""), "ok");
+  } catch (e) { status("Apply failed: " + e.message, "err"); }
+}
+
+async function restart() {
+  if (!confirm("Restart the soundtouchd service on the speaker?")) return;
+  status("Restarting…", "info");
+  try {
+    await fetch(base() + "/restart", { method: "POST" });
+    status("Restart requested. Give it a few seconds, then Load again.", "ok");
+  } catch (e) {
+    // The connection often drops as the service restarts — that's expected.
+    status("Restart requested (connection dropped as expected). Wait a few seconds, then Load.", "ok");
+  }
+}
+</script>
+</body>
+</html>
