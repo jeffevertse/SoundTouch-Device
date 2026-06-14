@@ -221,6 +221,55 @@ func isRedirect(code int) bool {
 	return false
 }
 
+// openStream opens a long-lived HTTP GET for audio streaming. Unlike safeGet,
+// the http.Client has no overall Timeout so the body can be read indefinitely;
+// connection and header deadlines are enforced at the transport level.
+func openStream(raw string) (*http.Response, error) {
+	raw = downgrade(raw)
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" {
+		return nil, fmt.Errorf("only http/https URLs are allowed (got %q)", u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return nil, fmt.Errorf("URL has no hostname")
+	}
+	ip, err := resolvePublicIP(host)
+	if err != nil {
+		return nil, err
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+	}
+	pinned := *u
+	pinned.Host = net.JoinHostPort(ip, port)
+
+	req, err := http.NewRequest(http.MethodGet, pinned.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = u.Host
+	req.Header.Set("User-Agent", "SoundTouch/1.0")
+	c := &http.Client{
+		Timeout: 0, // no overall deadline — stream runs as long as data flows
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ResponseHeaderTimeout: 15 * time.Second,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return c.Do(req)
+}
+
 // Proxy streams the resolved station to w as clean audio (no ICY metadata).
 func Proxy(w http.ResponseWriter, stationURL string) {
 	direct, err := Resolve(stationURL)
@@ -228,7 +277,7 @@ func Proxy(w http.ResponseWriter, stationURL string) {
 		http.Error(w, "no stream", http.StatusNotFound)
 		return
 	}
-	resp, err := safeGet(http.MethodGet, direct, 15*time.Second)
+	resp, err := openStream(direct)
 	if err != nil {
 		http.Error(w, "stream error", http.StatusBadGateway)
 		return
@@ -236,7 +285,7 @@ func Proxy(w http.ResponseWriter, stationURL string) {
 	if isRedirect(resp.StatusCode) {
 		loc := resp.Header.Get("Location")
 		resp.Body.Close()
-		resp, err = safeGet(http.MethodGet, loc, 15*time.Second)
+		resp, err = openStream(loc)
 		if err != nil {
 			http.Error(w, "stream error", http.StatusBadGateway)
 			return
