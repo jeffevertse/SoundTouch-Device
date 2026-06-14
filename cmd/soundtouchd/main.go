@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gesellix/bose-soundtouch/pkg/client"
+	"github.com/gesellix/bose-soundtouch/pkg/models"
 
 	"github.com/jeffevertse/soundtouch-device/internal/presets"
 	"github.com/jeffevertse/soundtouch-device/internal/resume"
@@ -129,6 +130,12 @@ func main() {
 		}
 	}()
 
+	// Point the physical preset buttons at this daemon (after the device settles).
+	go func() {
+		time.Sleep(5 * time.Second)
+		syncHardwarePresets(st, store.Get(), streamBase)
+	}()
+
 	var playMu sync.Mutex
 	playPreset := func(id int) error {
 		p := store.Get().ByID(id)
@@ -206,6 +213,7 @@ func main() {
 				return
 			}
 			log.Printf("[soundtouchd] config updated via API (%d presets)", len(c.Presets))
+			go syncHardwarePresets(st, &c, streamBase)
 			writeJSON(w, map[string]any{"ok": true, "restartNeeded": c.ProxyPort != listenPort})
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -238,6 +246,10 @@ func main() {
 					log.Printf("[resume] %v", err)
 				}
 			}
+		}, func(id int) {
+			if err := playPreset(id); err != nil {
+				log.Printf("[preset] %v", err)
+			}
 		})
 		if err := watcher.Start(); err != nil {
 			log.Printf("[resume] websocket: %v", err)
@@ -247,6 +259,29 @@ func main() {
 	addr := fmt.Sprintf(":%d", listenPort)
 	log.Printf("[soundtouchd] listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+// syncHardwarePresets writes the configured stations into the speaker's 6 physical
+// preset slots as LOCAL_INTERNET_RADIO entries pointing at this daemon's stream
+// proxy, so pressing a physical button (or app preset) plays via us — not the dead
+// Bose cloud. Re-run whenever the config changes.
+func syncHardwarePresets(st *client.Client, cfg *presets.Config, streamBase string) {
+	for _, p := range cfg.Presets {
+		if p.StreamURL == "" {
+			continue
+		}
+		ci := &models.ContentItem{
+			Source:       "LOCAL_INTERNET_RADIO",
+			Type:         "stationurl",
+			Location:     fmt.Sprintf("%s/stream/%d", streamBase, p.ID),
+			IsPresetable: true,
+			ItemName:     p.Name,
+		}
+		if err := st.StorePreset(p.ID, ci); err != nil {
+			log.Printf("[soundtouchd] storePreset %d: %v", p.ID, err)
+		}
+	}
+	log.Printf("[soundtouchd] hardware presets synced -> %s/stream/<id>", streamBase)
 }
 
 // cors allows the local config editor (a file:// page → Origin "null", or one

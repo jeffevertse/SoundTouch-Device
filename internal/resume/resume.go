@@ -1,9 +1,13 @@
-// Package resume re-plays the last station when the speaker powers on, using the
-// SoundTouch WebSocket event stream (via the gesellix client).
+// Package resume watches the SoundTouch WebSocket and (1) re-plays the last
+// station when the speaker powers on, and (2) plays the matching preset via UPnP
+// when a physical preset button is pressed — the speaker's native recall of
+// LOCAL_INTERNET_RADIO presets is unreliable, so we drive playback ourselves.
 package resume
 
 import (
 	"log"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,27 +16,33 @@ import (
 	"github.com/gesellix/bose-soundtouch/pkg/models"
 )
 
-// resumeDebounce ignores repeat power-on triggers (the speaker can emit a couple
-// of STANDBY→on transitions in quick succession during wake-up).
-const resumeDebounce = 10 * time.Second
+const (
+	resumeDebounce = 10 * time.Second // ignore repeat power-on triggers
+	pressDebounce  = 3 * time.Second  // ignore repeat button-press frames
+)
 
-// Watcher detects STANDBY→on transitions and invokes play().
+// matches the selected preset id inside a nowSelectionUpdated frame
+var presetIDRe = regexp.MustCompile(`nowSelectionUpdated[\s\S]*?<preset[^>]*\bid="(\d+)"`)
+
+// Watcher reacts to power-on (onResume) and physical preset presses (onPreset).
 type Watcher struct {
 	client     *client.Client
-	play       func()
+	onResume   func()
+	onPreset   func(int)
 	mu         sync.Mutex
 	prev       string
 	lastResume time.Time
+	lastPress  time.Time
 }
 
-func New(c *client.Client, play func()) *Watcher {
-	return &Watcher{client: c, play: play}
+func New(c *client.Client, onResume func(), onPreset func(int)) *Watcher {
+	return &Watcher{client: c, onResume: onResume, onPreset: onPreset}
 }
 
-// Start connects the WebSocket and watches for power-on. The gesellix client
-// auto-reconnects, so this returns after the initial connect.
 func (w *Watcher) Start() error {
 	ws := w.client.NewWebSocketClient(client.DefaultWebSocketConfig())
+
+	// Power-on → resume last station.
 	ws.OnNowPlaying(func(ev *models.NowPlayingUpdatedEvent) {
 		src := strings.ToUpper(strings.TrimSpace(ev.NowPlaying.Source))
 		w.mu.Lock()
@@ -47,10 +57,41 @@ func (w *Watcher) Start() error {
 		switch {
 		case fire:
 			log.Printf("[resume] power-on detected (%s -> %s) — resuming", prev, src)
-			go w.play()
+			go w.onResume()
 		case powerOn:
 			log.Printf("[resume] power-on (%s -> %s) ignored (debounced)", prev, src)
 		}
 	})
+
+	// Physical preset button → play that preset via UPnP.
+	ws.OnRawMessage(func(data []byte, _ error) {
+		s := string(data)
+		if !strings.Contains(s, "nowSelectionUpdated") {
+			return
+		}
+		m := presetIDRe.FindStringSubmatch(s)
+		if m == nil {
+			return
+		}
+		id, err := strconv.Atoi(m[1])
+		if err != nil || id < 1 {
+			return
+		}
+		w.mu.Lock()
+		recent := time.Since(w.lastPress) < pressDebounce
+		if !recent {
+			w.lastPress = time.Now()
+		}
+		w.mu.Unlock()
+		if recent {
+			return
+		}
+		log.Printf("[preset] physical button %d pressed — playing via UPnP", id)
+		go func() {
+			time.Sleep(2 * time.Second) // let the speaker's own (often-failing) recall settle
+			w.onPreset(id)
+		}()
+	})
+
 	return ws.Connect()
 }

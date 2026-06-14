@@ -77,6 +77,11 @@ curl http://<speaker-ip>:8099/status
 
 The last station played is remembered and **auto-resumes when the speaker powers on**.
 
+**Physical preset buttons** (and the SoundTouch app's presets) play your stations too: on startup and
+after every config change the daemon writes the presets into the speaker's 6 hardware slots, and it
+watches the device's WebSocket — when a preset button is pressed it plays that station via UPnP (the
+speaker's own recall of internet-radio presets is unreliable, so the daemon drives it).
+
 ### Config editor (local HTML)
 
 `editor/config-editor.html` is a self-contained page (no dependencies) for editing presets without
