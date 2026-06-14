@@ -238,7 +238,8 @@ func main() {
 		}()
 	})
 
-	// Auto-resume on power-on.
+	// Auto-resume on power-on + physical preset buttons. Retries on failure so
+	// a cold boot (firmware WebSocket not ready yet) self-heals.
 	go func() {
 		watcher := resume.New(st, func() {
 			// Never wake a speaker that is actually off (guards a late/stale event).
@@ -256,8 +257,15 @@ func main() {
 				log.Printf("[preset] %v", err)
 			}
 		})
-		if err := watcher.Start(); err != nil {
-			log.Printf("[resume] websocket: %v", err)
+		for {
+			err := watcher.Start()
+			if err != nil {
+				log.Printf("[resume] websocket error: %v — retrying in 15s", err)
+				time.Sleep(15 * time.Second)
+			} else {
+				log.Printf("[resume] websocket closed — reconnecting in 5s")
+				time.Sleep(5 * time.Second)
+			}
 		}
 	}()
 
@@ -341,7 +349,8 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // localIP returns this machine's outbound LAN IP (the address the renderer can
-// use to reach our stream proxy). Falls back to 127.0.0.1.
+// use to reach our stream proxy). Falls back to interface enumeration (works
+// when the external routing table is not yet populated at cold boot).
 func localIP(peer string) string {
 	for _, target := range []string{net.JoinHostPort(peer, "80"), "8.8.8.8:80"} {
 		conn, err := net.DialTimeout("udp", target, 2*time.Second)
@@ -352,6 +361,27 @@ func localIP(peer string) string {
 		conn.Close()
 		if ip != nil && !ip.IsLoopback() {
 			return ip.String()
+		}
+	}
+	// No external route yet (early boot) — enumerate interfaces directly.
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, _ := iface.Addrs()
+			for _, addr := range addrs {
+				var ip net.IP
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip4 := ip.To4(); ip4 != nil {
+					return ip4.String()
+				}
+			}
 		}
 	}
 	return "127.0.0.1"
