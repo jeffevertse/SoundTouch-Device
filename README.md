@@ -1,4 +1,4 @@
-# soundtouch-device
+# SoundTouch-Device
 
 Run a small internet-radio controller **on a Bose SoundTouch speaker itself** — no
 Raspberry Pi or Home Assistant box required. It's a from-scratch Go re-implementation
