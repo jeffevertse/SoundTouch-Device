@@ -126,3 +126,7 @@ internal/resume       power-on detection via WebSocket
 packaging/            init script, install/uninstall (run on device)
 scripts/              backup.sh, deploy-tmp.sh (run from the Mac)
 ```
+
+## Related
+
+- **[SoundTouch-Device-Companion-App](https://github.com/jeffevertse/SoundTouch-Device-Companion-App)** — native iOS app for controlling presets, viewing now-playing, and adjusting bass over this HTTP API
