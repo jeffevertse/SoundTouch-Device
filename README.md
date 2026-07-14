@@ -60,10 +60,16 @@ device on your LAN, or from the speaker itself via `127.0.0.1`. Replace `<speake
 
 | Method | Endpoint        | Purpose                                                            |
 | ------ | --------------- | ----------------------------------------------------------------- |
+| GET    | `/`             | Built-in config editor (HTML page, served by the daemon).          |
 | GET    | `/play/<id>`    | Play preset `<id>` (1–6). Returns `{"ok":true,"preset":<id>}`.     |
 | GET    | `/stream/<id>`  | Audio proxy for preset `<id>` — the speaker fetches this, not you. |
 | GET    | `/status`       | Current now-playing (JSON, from the speaker's own API).           |
 | GET    | `/healthz`      | Liveness: `{"ok":true,"version":"…","rendererReady":<bool>}`.      |
+
+Mutating endpoints (`POST /config`, `POST /bass`, `POST /restart`) require
+`Content-Type: application/json` (blocks cross-site form posts). Optionally set `api_token`
+in the config to also require `Authorization: Bearer <token>` on those endpoints — empty
+(the default) means no auth, which keeps the iOS companion app working unchanged.
 
 ```sh
 # play a preset
@@ -82,19 +88,16 @@ after every config change the daemon writes the presets into the speaker's 6 har
 watches the device's WebSocket — when a preset button is pressed it plays that station via UPnP (the
 speaker's own recall of internet-radio presets is unreliable, so the daemon drives it).
 
-### Config editor (local HTML)
+### Config editor (built in)
 
-`editor/config-editor.html` is a self-contained page (no dependencies) for editing presets without
-SSH. Open it in a browser, enter the speaker's IP (and port `8099`), click **Load**, edit the
-presets, then **Save & Apply** — changes take effect immediately. Use **Restart service** only after
+The daemon serves a self-contained editor page at `http://<speaker-ip>:8099/` — open it in a
+browser to edit presets and bass without SSH. It pre-fills the connection from the URL and loads
+automatically; **Save & Apply** takes effect immediately. Use **Restart service** only after
 changing `proxy_port`.
 
-```sh
-open editor/config-editor.html        # macOS — or just double-click the file
-```
-
-It talks to the daemon's `/config` API over your LAN. CORS is restricted to `file://`/localhost/
-private-network origins, so a random public website can't reach your speaker.
+Because the editor is served by the daemon itself it is same-origin with the API — no CORS
+involved. CORS for other tools is restricted to localhost/private-network origins (`Origin: null`
+is deliberately rejected), so a public website can't reach your speaker through your browser.
 
 ### Editing stations (SSH)
 
@@ -118,7 +121,7 @@ Use any public MP3/AAC stream URL, or a `.pls`/`.m3u` playlist; HTTPS is downgra
 ## Layout
 
 ```
-cmd/soundtouchd     entrypoint (HTTP proxy + control, UPnP, auto-resume)
+cmd/soundtouchd     entrypoint (HTTP proxy + control, UPnP, auto-resume, embedded editor.html)
 internal/streamproxy  HTTPS→HTTP + playlist resolution + SSRF guard (tested)
 internal/presets      JSON config (tested)
 internal/upnp         AVTransport SetAVTransportURI + Play

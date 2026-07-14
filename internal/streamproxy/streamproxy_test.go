@@ -21,7 +21,13 @@ func TestDowngrade(t *testing.T) {
 }
 
 func TestIsBlockedIP(t *testing.T) {
-	blocked := []string{"127.0.0.1", "10.1.2.3", "192.168.1.5", "172.16.0.1", "169.254.169.254", "0.0.0.0", "::1"}
+	blocked := []string{
+		"127.0.0.1", "10.1.2.3", "192.168.1.5", "172.16.0.1", "169.254.169.254", "0.0.0.0", "::1",
+		"100.64.0.1",              // CGNAT
+		"192.0.0.170", "198.18.0.5", // IETF protocol assignments + benchmarking
+		"224.0.0.251", "239.255.255.250", "255.255.255.255", "240.0.0.1", // multicast + reserved + broadcast
+		"ff02::1", // IPv6 multicast
+	}
 	for _, s := range blocked {
 		if !isBlockedIP(net.ParseIP(s)) {
 			t.Errorf("%s should be blocked", s)
@@ -59,6 +65,19 @@ func TestResolvePublicIP(t *testing.T) {
 	lookupIP = func(string) ([]net.IP, error) { return nil, fmt.Errorf("nxdomain") }
 	if _, err := resolvePublicIP("nope.test"); err == nil {
 		t.Fatal("unresolvable should error")
+	}
+}
+
+func TestResolveLocation(t *testing.T) {
+	cases := []struct{ base, loc, want string }{
+		{"http://x.com/live", "https://cdn.x.com/stream", "http://cdn.x.com/stream"}, // absolute + downgrade
+		{"http://x.com/a/b.pls", "/stream.mp3", "http://x.com/stream.mp3"},           // host-relative
+		{"http://x.com/a/b.pls", "c.mp3", "http://x.com/a/c.mp3"},                    // path-relative
+	}
+	for _, c := range cases {
+		if got := resolveLocation(c.base, c.loc); got != c.want {
+			t.Errorf("resolveLocation(%q, %q) = %q, want %q", c.base, c.loc, got, c.want)
+		}
 	}
 }
 

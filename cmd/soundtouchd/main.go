@@ -4,10 +4,13 @@
 package main
 
 import (
+	"crypto/subtle"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gesellix/bose-soundtouch/pkg/client"
@@ -27,6 +31,12 @@ import (
 )
 
 var version = "dev"
+
+// The config editor is served from the daemon itself (GET /) so it is
+// same-origin with the API — no CORS or file:// special-casing needed.
+//
+//go:embed editor.html
+var editorHTML []byte
 
 // configStore is the thread-safe holder for the live config. Replace swaps the
 // whole pointer (hot-reload); readers get a consistent snapshot via Get.
@@ -51,8 +61,14 @@ func (s *configStore) LastPreset() int {
 func (s *configStore) SetLastPreset(id int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cfg.LastPresetID = id
-	_ = s.cfg.Save(s.path)
+	if s.cfg.LastPresetID == id {
+		return // avoid needless flash writes on /mnt/nv
+	}
+	// Copy-on-write: snapshots handed out by Get() are never mutated.
+	c := s.cfg.Clone()
+	c.LastPresetID = id
+	_ = c.Save(s.path)
+	s.cfg = c
 }
 
 // Replace validates, persists, and swaps in a new config.
@@ -83,8 +99,33 @@ func validateConfig(c *presets.Config) error {
 		if p.ID < 1 || p.ID > 6 {
 			return fmt.Errorf("preset id %d out of range (1-6)", p.ID)
 		}
+		if p.StreamURL != "" {
+			u, err := url.Parse(p.StreamURL)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return fmt.Errorf("preset %d: stream_url must be an http(s) URL", p.ID)
+			}
+		}
 	}
 	return nil
+}
+
+// requireMutation gates state-changing requests: the JSON Content-Type blocks
+// cross-site form posts (forms can't send application/json), and when an
+// api_token is configured the request must carry it as a Bearer token.
+func requireMutation(w http.ResponseWriter, r *http.Request, cfg *presets.Config) bool {
+	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if ct != "application/json" {
+		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+		return false
+	}
+	if cfg.APIToken != "" {
+		tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(tok)), []byte(cfg.APIToken)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return false
+		}
+	}
+	return true
 }
 
 func main() {
@@ -131,12 +172,13 @@ func main() {
 	log.Printf("[soundtouchd] proxy=%s", streamBase)
 
 	// Resolve the UPnP AVTransport control URL. Retry in case the renderer
-	// comes up slightly after the HTTP API.
-	var player *upnp.Player
+	// comes up slightly after the HTTP API. atomic.Pointer: written here,
+	// read by HTTP handlers on other goroutines.
+	var player atomic.Pointer[upnp.Player]
 	go func() {
 		for {
 			if url, err := upnp.FindControlURL(streamHost, deviceID); err == nil {
-				player = upnp.New(url)
+				player.Store(upnp.New(url))
 				log.Printf("[soundtouchd] AVTransport control URL: %s", url)
 				return
 			}
@@ -158,13 +200,14 @@ func main() {
 		if p == nil || p.StreamURL == "" {
 			return fmt.Errorf("preset %d not configured", id)
 		}
-		if player == nil {
+		pl := player.Load()
+		if pl == nil {
 			return fmt.Errorf("renderer not ready yet")
 		}
 		playMu.Lock()
 		defer playMu.Unlock()
 		streamURL := fmt.Sprintf("%s/stream/%d", streamBase, id)
-		if err := player.Play(streamURL); err != nil {
+		if err := pl.Play(streamURL); err != nil {
 			return err
 		}
 		store.SetLastPreset(id)
@@ -174,11 +217,31 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// Config editor UI (same-origin with the API, so no CORS involved).
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(editorHTML)
+	})
+
+	// Cap concurrent outbound stream fetches — the speaker itself needs 1;
+	// this keeps a misbehaving LAN client from exhausting the device's RAM.
+	streamSem := make(chan struct{}, 4)
 	mux.HandleFunc("/stream/", func(w http.ResponseWriter, r *http.Request) {
 		id, ok := idFromPath(r.URL.Path, "/stream/")
 		p := store.Get().ByID(id)
 		if !ok || p == nil || p.StreamURL == "" {
 			http.NotFound(w, r)
+			return
+		}
+		select {
+		case streamSem <- struct{}{}:
+			defer func() { <-streamSem }()
+		default:
+			http.Error(w, "too many concurrent streams", http.StatusServiceUnavailable)
 			return
 		}
 		streamproxy.Proxy(w, p.StreamURL)
@@ -198,7 +261,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"ok": true, "version": version, "rendererReady": player != nil})
+		writeJSON(w, map[string]any{"ok": true, "version": version, "rendererReady": player.Load() != nil})
 	})
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -217,12 +280,23 @@ func main() {
 		case http.MethodOptions:
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodGet:
-			writeJSON(w, store.Get())
+			// Never expose the token; shallow copy is safe (scalar field only).
+			c := *store.Get()
+			c.APIToken = ""
+			writeJSON(w, &c)
 		case http.MethodPost, http.MethodPut:
+			if !requireMutation(w, r, store.Get()) {
+				return
+			}
 			var c presets.Config
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&c); err != nil {
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 				return
+			}
+			if c.APIToken == "" {
+				// GET /config redacts the token, so round-tripped configs come
+				// back without it — keep the existing one rather than wiping it.
+				c.APIToken = store.Get().APIToken
 			}
 			if err := store.Replace(&c); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -249,6 +323,9 @@ func main() {
 			}
 			writeJSON(w, map[string]any{"level": b.ActualBass})
 		case http.MethodPost, http.MethodPut:
+			if !requireMutation(w, r, store.Get()) {
+				return
+			}
 			var req struct {
 				Level int `json:"level"`
 			}
@@ -275,6 +352,9 @@ func main() {
 		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !requireMutation(w, r, store.Get()) {
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true, "restarting": true})
@@ -317,11 +397,18 @@ func main() {
 		}
 	}()
 
-	// HTTP server: mux is fully set up by this point.
-	addr := fmt.Sprintf(":%d", listenPort)
+	// HTTP server: mux is fully set up by this point. WriteTimeout must stay 0
+	// (unset) — /stream responses are unbounded audio.
+	srv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", listenPort),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // Slowloris guard
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
-		log.Printf("[soundtouchd] listening on %s", addr)
-		log.Fatal(http.ListenAndServe(addr, mux))
+		log.Printf("[soundtouchd] listening on %s", srv.Addr)
+		log.Fatal(srv.ListenAndServe())
 	}()
 
 	select {} // goroutines run forever; this keeps main alive
@@ -356,16 +443,18 @@ func syncHardwarePresets(st *client.Client, cfg *presets.Config, streamBase stri
 	return ok
 }
 
-// cors allows the local config editor (a file:// page → Origin "null", or one
-// served from localhost/the LAN) to call the API, while public websites get no
-// CORS header and are blocked by the browser.
+// cors allows pages served from localhost/the LAN (e.g. a Home Assistant
+// dashboard) to call the API, while public websites get no CORS header and are
+// blocked by the browser. Origin "null" (file:// pages, but also sandboxed
+// iframes on public sites) is deliberately NOT allowed — the bundled editor is
+// served same-origin from GET / instead.
 func cors(w http.ResponseWriter, r *http.Request) {
 	o := r.Header.Get("Origin")
-	if o == "null" || isLocalOrigin(o) {
+	if isLocalOrigin(o) {
 		w.Header().Set("Access-Control-Allow-Origin", o)
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	}
 }
 

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeffevertse/soundtouch-device/internal/presets"
 )
@@ -26,6 +30,16 @@ func TestValidateConfig(t *testing.T) {
 	bad.Presets[0].ID = 9
 	if validateConfig(bad) == nil {
 		t.Error("preset id 9 should be rejected")
+	}
+	bad = presets.Default()
+	bad.Presets[0].StreamURL = "ftp://example.com/stream"
+	if validateConfig(bad) == nil {
+		t.Error("non-http(s) stream_url should be rejected")
+	}
+	bad = presets.Default()
+	bad.Presets[0].StreamURL = "not a url"
+	if validateConfig(bad) == nil {
+		t.Error("unparseable stream_url should be rejected")
 	}
 }
 
@@ -66,6 +80,65 @@ func TestConfigStoreLastPreset(t *testing.T) {
 	if s.LastPreset() != 4 {
 		t.Errorf("LastPreset = %d, want 4", s.LastPreset())
 	}
+
+	// Snapshots handed out before the change must not be mutated (copy-on-write).
+	snap := s.Get()
+	s.SetLastPreset(5)
+	if snap.LastPresetID != 4 {
+		t.Errorf("old snapshot mutated: LastPresetID = %d, want 4", snap.LastPresetID)
+	}
+
+	// Unchanged id must not rewrite the file (flash wear on /mnt/nv).
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("config should exist: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	s.SetLastPreset(5)
+	after, _ := os.Stat(path)
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Error("unchanged last preset should not rewrite the config file")
+	}
+}
+
+func TestRequireMutation(t *testing.T) {
+	cfg := presets.Default()
+
+	post := func(contentType, auth string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/config", strings.NewReader("{}"))
+		if contentType != "" {
+			r.Header.Set("Content-Type", contentType)
+		}
+		if auth != "" {
+			r.Header.Set("Authorization", auth)
+		}
+		requireMutation(w, r, cfg)
+		return w
+	}
+
+	// No token configured: JSON Content-Type is still required (CSRF guard).
+	if w := post("", ""); w.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("missing Content-Type: got %d, want 415", w.Code)
+	}
+	if w := post("text/plain", ""); w.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("text/plain (form CSRF vector): got %d, want 415", w.Code)
+	}
+	if w := post("application/json; charset=utf-8", ""); w.Code != http.StatusOK {
+		t.Errorf("JSON without token requirement: got %d, want 200", w.Code)
+	}
+
+	// Token configured: bearer required on top of the Content-Type.
+	cfg.APIToken = "s3cret"
+	if w := post("application/json", ""); w.Code != http.StatusUnauthorized {
+		t.Errorf("missing bearer: got %d, want 401", w.Code)
+	}
+	if w := post("application/json", "Bearer wrong"); w.Code != http.StatusUnauthorized {
+		t.Errorf("wrong bearer: got %d, want 401", w.Code)
+	}
+	if w := post("application/json", "Bearer s3cret"); w.Code != http.StatusOK {
+		t.Errorf("correct bearer: got %d, want 200", w.Code)
+	}
 }
 
 func TestIsLocalOrigin(t *testing.T) {
@@ -83,13 +156,23 @@ func TestIsLocalOrigin(t *testing.T) {
 }
 
 func TestCORS(t *testing.T) {
-	// file:// pages send Origin: null → must be allowed
+	// Origin "null" (sandboxed iframes on public sites, file:// pages) must NOT
+	// be allowed — the editor is served same-origin from GET / instead.
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/config", nil)
 	r.Header.Set("Origin", "null")
 	cors(w, r)
-	if w.Header().Get("Access-Control-Allow-Origin") != "null" {
-		t.Error("Origin null should be reflected")
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Error("Origin null should not be allowed")
+	}
+
+	// a LAN origin gets CORS (e.g. a Home Assistant dashboard)
+	w = httptest.NewRecorder()
+	r = httptest.NewRequest("GET", "/config", nil)
+	r.Header.Set("Origin", "http://192.168.1.50")
+	cors(w, r)
+	if w.Header().Get("Access-Control-Allow-Origin") != "http://192.168.1.50" {
+		t.Error("LAN origin should be reflected")
 	}
 
 	// a public website must NOT get a CORS header

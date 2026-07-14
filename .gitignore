@@ -1,5 +1,6 @@
 # build output
 dist/
+/soundtouchd
 
 # Phase-0 device snapshots (may contain device config)
 backup/

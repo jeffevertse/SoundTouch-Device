@@ -25,6 +25,9 @@ var privateNets = func() []*net.IPNet {
 	cidrs := []string{
 		"0.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 		"127.0.0.0/8", "169.254.0.0/16", // link-local + cloud metadata
+		"100.64.0.0/10",                // CGNAT
+		"192.0.0.0/24", "198.18.0.0/15", // IETF protocol assignments + benchmarking
+		"224.0.0.0/4", "240.0.0.0/4", // multicast + reserved
 		"::1/128", "fc00::/7", "fe80::/10",
 	}
 	out := make([]*net.IPNet, 0, len(cidrs))
@@ -45,6 +48,9 @@ func isBlockedIP(ip net.IP) bool {
 	// the IPv4 ranges, not accidentally matched by an IPv6 net.
 	if v4 := ip.To4(); v4 != nil {
 		ip = v4
+	}
+	if ip.IsMulticast() || ip.IsUnspecified() {
+		return true
 	}
 	for _, n := range privateNets {
 		if n.Contains(ip) {
@@ -175,6 +181,41 @@ func safeGet(method, raw string, timeout time.Duration) (*http.Response, error) 
 	return client.Do(req)
 }
 
+// maxRedirects bounds how many redirect hops the proxy will chase; every hop
+// is re-validated (resolve + private-IP check) before it is fetched.
+const maxRedirects = 5
+
+// resolveLocation resolves a redirect Location (possibly relative) against the
+// URL that issued it, downgraded to HTTP.
+func resolveLocation(base, loc string) string {
+	b, err := url.Parse(base)
+	if err != nil {
+		return downgrade(loc)
+	}
+	l, err := url.Parse(loc)
+	if err != nil {
+		return downgrade(loc)
+	}
+	return downgrade(b.ResolveReference(l).String())
+}
+
+// follow performs safeGet and chases up to maxRedirects redirect hops.
+// It returns the final response and the URL it came from.
+func follow(method, raw string, timeout time.Duration) (*http.Response, string, error) {
+	for hop := 0; ; hop++ {
+		resp, err := safeGet(method, raw, timeout)
+		if err != nil {
+			return nil, "", err
+		}
+		loc := resp.Header.Get("Location")
+		if !isRedirect(resp.StatusCode) || loc == "" || hop >= maxRedirects {
+			return resp, raw, nil
+		}
+		resp.Body.Close()
+		raw = resolveLocation(raw, loc)
+	}
+}
+
 // Resolve turns a configured station URL into a direct HTTP stream URL,
 // downgrading HTTPS and resolving PLS/M3U playlists.
 func Resolve(raw string) (string, error) {
@@ -184,24 +225,17 @@ func Resolve(raw string) (string, error) {
 	raw = downgrade(raw)
 	isPlaylist := looksLikePlaylistExt(raw)
 	if !isPlaylist {
-		if head, err := safeGet(http.MethodHead, raw, 5*time.Second); err == nil {
+		if head, final, err := follow(http.MethodHead, raw, 5*time.Second); err == nil {
 			ct := head.Header.Get("Content-Type")
-			loc := head.Header.Get("Location")
 			head.Body.Close()
-			if isRedirect(head.StatusCode) && loc != "" {
-				raw = downgrade(loc)
-				if h2, err := safeGet(http.MethodHead, raw, 5*time.Second); err == nil {
-					ct = h2.Header.Get("Content-Type")
-					h2.Body.Close()
-				}
-			}
-			isPlaylist = looksLikePlaylistCT(ct)
+			raw = final
+			isPlaylist = looksLikePlaylistCT(ct) || looksLikePlaylistExt(final)
 		}
 	}
 	if !isPlaylist {
 		return raw, nil
 	}
-	resp, err := safeGet(http.MethodGet, raw, 10*time.Second)
+	resp, _, err := follow(http.MethodGet, raw, 10*time.Second)
 	if err != nil {
 		return raw, nil // fall back to original on fetch failure
 	}
@@ -282,10 +316,15 @@ func Proxy(w http.ResponseWriter, stationURL string) {
 		http.Error(w, "stream error", http.StatusBadGateway)
 		return
 	}
-	if isRedirect(resp.StatusCode) {
+	for hop := 0; isRedirect(resp.StatusCode) && hop < maxRedirects; hop++ {
 		loc := resp.Header.Get("Location")
 		resp.Body.Close()
-		resp, err = openStream(loc)
+		if loc == "" {
+			http.Error(w, "stream error", http.StatusBadGateway)
+			return
+		}
+		direct = resolveLocation(direct, loc)
+		resp, err = openStream(direct)
 		if err != nil {
 			http.Error(w, "stream error", http.StatusBadGateway)
 			return

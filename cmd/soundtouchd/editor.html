@@ -48,9 +48,10 @@
     <div class="conn">
       <div><label>Device IP / host</label><input id="host" placeholder="192.168.1.29"></div>
       <div style="max-width:110px"><label>Port</label><input id="port" placeholder="8099"></div>
+      <div><label>API token (optional)</label><input id="token" type="password" placeholder="(only if set in config)"></div>
       <button class="btn" id="loadBtn" onclick="load()">Load</button>
     </div>
-    <p class="muted" style="margin:10px 0 0">Tip: this is the SoundTouch's own IP and the soundtouchd port (default 8099).</p>
+    <p class="muted" style="margin:10px 0 0">Tip: this is the SoundTouch's own IP and the soundtouchd port (default 8099). The token is only needed if <code>api_token</code> is set in the config.</p>
   </div>
 
   <div id="editor" style="display:none">
@@ -104,11 +105,30 @@ document.addEventListener("DOMContentLoaded", () => {
 // persist connection
 $("host").value = localStorage.getItem("st_host") || "192.168.1.29";
 $("port").value = localStorage.getItem("st_port") || "8099";
+$("token").value = localStorage.getItem("st_token") || "";
+
+// Served from the daemon itself (GET /)? Pre-fill from the page URL and load
+// straight away.
+if (location.protocol.startsWith("http") && location.hostname) {
+  $("host").value = location.hostname;
+  $("port").value = location.port || (location.protocol === "https:" ? "443" : "80");
+  load();
+}
 
 function base() {
   const h = $("host").value.trim(), p = ($("port").value.trim() || "8099");
   localStorage.setItem("st_host", h); localStorage.setItem("st_port", p);
+  localStorage.setItem("st_token", $("token").value.trim());
   return `http://${h}:${p}`;
+}
+
+// Headers for mutating requests: the daemon requires the JSON Content-Type and,
+// when an api_token is configured, a matching Bearer token.
+function authHeaders() {
+  const h = { "Content-Type": "application/json" };
+  const t = $("token").value.trim();
+  if (t) h["Authorization"] = "Bearer " + t;
+  return h;
 }
 function status(msg, kind) {
   const el = $("status"); el.textContent = msg; el.className = "status show " + (kind || "info");
@@ -178,7 +198,7 @@ function esc(s) { return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt
 async function postConfig(cfg) {
   const r = await fetch(base() + "/config", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders(),
     body: JSON.stringify(cfg),
   });
   const text = await r.text();
@@ -214,7 +234,7 @@ async function setBass() {
   try {
     const r = await fetch(base() + "/bass", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify({ level }),
     });
     const text = await r.text();
@@ -227,7 +247,7 @@ async function restart() {
   if (!confirm("Restart the soundtouchd service on the speaker?")) return;
   status("Restarting…", "info");
   try {
-    await fetch(base() + "/restart", { method: "POST" });
+    await fetch(base() + "/restart", { method: "POST", headers: authHeaders(), body: "{}" });
     status("Restart requested. Give it a few seconds, then Load again.", "ok");
   } catch (e) {
     // The connection often drops as the service restarts — that's expected.

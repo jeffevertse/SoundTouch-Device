@@ -16,10 +16,19 @@ type Preset struct {
 }
 
 type Config struct {
-	DeviceHost   string   `json:"device_host"`    // "" → 127.0.0.1 (we run on the speaker)
-	ProxyPort    int      `json:"proxy_port"`     // local stream-proxy/control port
-	LastPresetID int      `json:"last_preset_id"` // for auto-resume
+	DeviceHost   string   `json:"device_host"`         // "" → 127.0.0.1 (we run on the speaker)
+	ProxyPort    int      `json:"proxy_port"`          // local stream-proxy/control port
+	APIToken     string   `json:"api_token,omitempty"` // "" → no auth; else required as Bearer token on mutating endpoints
+	LastPresetID int      `json:"last_preset_id"`      // for auto-resume
 	Presets      []Preset `json:"presets"`
+}
+
+// Clone returns a deep copy, so a mutated copy can be swapped in without
+// racing readers that hold the old snapshot.
+func (c *Config) Clone() *Config {
+	out := *c
+	out.Presets = append([]Preset(nil), c.Presets...)
+	return &out
 }
 
 // Default returns the starter configuration (mirrors the SoundTouch-Pi presets).
