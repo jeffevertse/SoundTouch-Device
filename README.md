@@ -33,13 +33,36 @@ make armv7      # static armv7 binary -> dist/soundtouchd  (needs Go)
 make test vet   # unit tests + vet (host)
 ```
 
-## Install on the speaker — safety first
+## Setting up a brand-new device
 
-SSH must be enabled (the `remote_services` USB trick). Modern clients need the legacy
-host-key flag (the Makefile/scripts include it).
+### 1. Enable SSH (one-time, per speaker)
+
+The speaker has no SSH access out of the box. Enable it once with the `remote_services` USB
+trick:
+
+1. Format a USB drive as FAT (FAT32/exFAT).
+2. Create an empty file named exactly `remote_services` at the root of the drive.
+3. Insert the drive into the speaker's USB port **while it's powered on**.
+4. Reboot the speaker (power-cycle it).
+
+After the reboot, root SSH is available with **no password**:
+
+```sh
+ssh -o HostKeyAlgorithms=+ssh-rsa root@<speaker-ip>
+```
+
+The `HostKeyAlgorithms=+ssh-rsa` flag is required because the speaker's SSH server only
+offers a legacy `ssh-rsa` host key, which modern OpenSSH clients disable by default. Every
+script and Makefile target in this repo already passes it for you.
+
+> **Security note:** this gives root, no-password SSH to anyone who can reach the speaker's IP.
+> Treat it like any other unauthenticated root shell on your LAN — don't expose the speaker's
+> SSH port beyond your home network.
+
+### 2. Install soundtouchd — safety first
 
 > **Always, in this order.** The `/tmp` step is the safety net: it persists nothing, so
-> a reboot fully reverts the speaker.
+> a reboot fully reverts the speaker if something's wrong.
 
 ```sh
 make backup  HOST=<speaker-ip>   # 1. Phase-0 snapshot -> ./backup/<date>/
@@ -51,6 +74,49 @@ make uninstall HOST=<speaker-ip> # rollback: remove everything we added
 This project is **additive** — it adds files under `/mnt/nv/soundtouchd/`, an
 `/etc/init.d/soundtouchd` service, and an `/opt/soundtouchd` symlink. It does **not**
 modify any Bose configuration, so `make uninstall` returns the device to stock.
+
+### 3. (Optional) Set an API token
+
+By default, anyone on your LAN can change presets or restart the service — fine for a home
+network, but you can lock it down. Set `api_token` in the config to require
+`Authorization: Bearer <token>` on `POST /config`, `/bass`, and `/restart`:
+
+```sh
+ssh -o HostKeyAlgorithms=+ssh-rsa root@<speaker-ip>
+vi /mnt/nv/soundtouchd/config.json   # add: "api_token": "<a long random string>"
+/etc/init.d/soundtouchd restart
+```
+
+Generate a good token with `openssl rand -hex 24`. You can also add/edit it via the
+[config editor](#config-editor-built-in)'s **Advanced → Raw JSON** panel instead of SSH.
+`GET /config` always redacts the token in its response, and re-saving the config from the
+editor never clears it. Leave it unset (the default) and mutating requests need no auth — this
+is what the [iOS companion app](#related) expects unless you also set a token there
+(Settings → Change device → API token).
+
+### Reinstalling / recovering
+
+A Bose firmware update can wipe everything under `/mnt/nv`, including this daemon and its
+config. Recovery is the same install flow — SSH itself is unaffected by firmware updates (it's
+a device-level modification, not a `/mnt/nv` file), so no need to repeat the USB step:
+
+```sh
+make backup  HOST=<speaker-ip>   # snapshot first, in case anything else changed
+make install HOST=<speaker-ip>   # re-installs the binary, service, and config.json
+```
+
+`install.sh` only seeds a fresh `config.example.json` when `/mnt/nv/soundtouchd/config.json` is
+**absent** — if it survived the firmware update, your presets and `api_token` are preserved
+automatically. If it didn't, `make backup` (run regularly, or right before an update if you know
+one's coming) saves a copy of `config.json` alongside the Bose config files in
+`./backup/<date>/`; copy it back with:
+
+```sh
+scp -O -o HostKeyAlgorithms=+ssh-rsa ./backup/<date>/config.json root@<speaker-ip>:/mnt/nv/soundtouchd/config.json
+ssh -o HostKeyAlgorithms=+ssh-rsa root@<speaker-ip> '/etc/init.d/soundtouchd restart'
+```
+
+Without a prior backup, just re-enter your presets via the [config editor](#config-editor-built-in).
 
 ## Usage
 
@@ -105,7 +171,7 @@ Presets live in `/mnt/nv/soundtouchd/config.json` on the speaker — edit over S
 
 ```sh
 ssh -o HostKeyAlgorithms=+ssh-rsa root@<speaker-ip>
-vi /mnt/nv/soundtouchd/config.json       # set name / stream_url / icon per preset (ids 1–6)
+vi /mnt/nv/soundtouchd/config.json       # set name / stream_url per preset (ids 1–6)
 /etc/init.d/soundtouchd restart
 ```
 

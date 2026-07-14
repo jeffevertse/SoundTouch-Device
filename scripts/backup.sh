@@ -25,4 +25,8 @@ ssh $SSHOPT "root@$HOST" '
 scp -O $SSHOPT "root@$HOST:/opt/Bose/etc/SoundTouchSdkPrivateCfg.xml" "$DIR/" 2>/dev/null || echo "(no SoundTouchSdkPrivateCfg.xml)"
 scp -O $SSHOPT "root@$HOST:/mnt/nv/BoseApp-Persistence/1/Sources.xml" "$DIR/" 2>/dev/null || echo "(no Sources.xml)"
 
+# Copy off our own config too, so a firmware update that wipes /mnt/nv (or a bad
+# install) can be recovered from the most recent backup instead of starting over.
+scp -O $SSHOPT "root@$HOST:/mnt/nv/soundtouchd/config.json" "$DIR/" 2>/dev/null || echo "(no soundtouchd config.json yet)"
+
 echo "Done. Review $DIR/device-state.txt before installing anything."
