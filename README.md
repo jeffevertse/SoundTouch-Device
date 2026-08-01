@@ -10,7 +10,7 @@ because the speaker can't run the original Python app.
 The SoundTouch (firmware 27.x) is **armv7 embedded Linux with BusyBox only** — no
 Python/Node/compiler — and the writable `/mnt/nv` partition has just ~20–40 MB free.
 So the Python app can't run there. The working pattern (cf. gesellix *AfterTouch*) is a
-**single static armv7 binary**; this one is ~6.5 MB.
+**single static armv7 binary**; this one is ~6.9 MB.
 
 ## What it does (focused subset)
 
