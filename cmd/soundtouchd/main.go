@@ -290,6 +290,9 @@ func main() {
 				return
 			}
 			log.Printf("[soundtouchd] config updated via API (%d presets)", len(c.Presets))
+			// An edited stream_url must take effect now, not when the proxy's
+			// resolution cache happens to expire.
+			streamproxy.InvalidateCache()
 			go syncHardwarePresets(st, &c, streamBase)
 			writeJSON(w, map[string]any{"ok": true, "restartNeeded": c.ProxyPort != listenPort})
 		default:

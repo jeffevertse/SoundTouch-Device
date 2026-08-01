@@ -236,3 +236,89 @@ func TestRelayKeepsAliveWhileDataFlows(t *testing.T) {
 		t.Errorf("body = %q, want 5 chunks", got)
 	}
 }
+
+// The cache must actually short-circuit resolution. station.test is
+// unresolvable, so a miss would fall through to Resolve and come back as the
+// station URL itself — reaching the memoised value proves no network call ran.
+func TestCachedResolveServesFromCache(t *testing.T) {
+	InvalidateCache()
+	defer InvalidateCache()
+
+	const station = "http://station.test/live"
+	resolveMu.Lock()
+	resolveCache[station] = cacheEntry{direct: "http://edge.test/abc", at: time.Now()}
+	resolveMu.Unlock()
+
+	got, err := cachedResolve(context.Background(), station)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://edge.test/abc" {
+		t.Errorf("got %q, want the cached resolution", got)
+	}
+}
+
+func TestCachedResolveExpiresEntries(t *testing.T) {
+	InvalidateCache()
+	defer InvalidateCache()
+
+	const station = "http://station.test/live"
+	resolveMu.Lock()
+	resolveCache[station] = cacheEntry{
+		direct: "http://edge.test/stale",
+		at:     time.Now().Add(-2 * resolveTTL),
+	}
+	resolveMu.Unlock()
+
+	got, _ := cachedResolve(context.Background(), station)
+	if got == "http://edge.test/stale" {
+		t.Error("an entry older than resolveTTL must not be served")
+	}
+}
+
+func TestDropCachedAndInvalidate(t *testing.T) {
+	InvalidateCache()
+	defer InvalidateCache()
+
+	const a, b = "http://a.test/live", "http://b.test/live"
+	resolveMu.Lock()
+	resolveCache[a] = cacheEntry{direct: "http://edge.test/a", at: time.Now()}
+	resolveCache[b] = cacheEntry{direct: "http://edge.test/b", at: time.Now()}
+	resolveMu.Unlock()
+
+	// dropCached removes one station and leaves the rest alone — a failing
+	// stream must not flush every other preset's resolution.
+	dropCached(a)
+	resolveMu.Lock()
+	_, gotA := resolveCache[a]
+	_, gotB := resolveCache[b]
+	resolveMu.Unlock()
+	if gotA {
+		t.Error("dropCached should have removed the entry")
+	}
+	if !gotB {
+		t.Error("dropCached must not touch other stations")
+	}
+
+	// InvalidateCache clears everything (config change).
+	InvalidateCache()
+	resolveMu.Lock()
+	n := len(resolveCache)
+	resolveMu.Unlock()
+	if n != 0 {
+		t.Errorf("InvalidateCache left %d entries", n)
+	}
+}
+
+func TestStreamable(t *testing.T) {
+	for _, c := range []int{200, 206} {
+		if !streamable(c) {
+			t.Errorf("%d should be streamable", c)
+		}
+	}
+	for _, c := range []int{204, 301, 302, 404, 500, 503} {
+		if streamable(c) {
+			t.Errorf("%d should not be streamable", c)
+		}
+	}
+}
