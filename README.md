@@ -26,12 +26,37 @@ Built on the MIT-licensed Go library
 [`github.com/gesellix/bose-soundtouch`](https://github.com/gesellix/Bose-SoundTouch)
 (`pkg/client` for the device API + WebSocket).
 
-## Build
+## Download or build
+
+Every [release](https://github.com/jeffevertse/SoundTouch-Device/releases) attaches a
+prebuilt static armv7 binary, so you don't need Go to install this. The attached binary is
+the one CI built for the tagged commit — the same bytes the checksum covers:
+
+```sh
+V=v0.6.0
+BASE=https://github.com/jeffevertse/SoundTouch-Device/releases/download/$V
+curl -fsSLO $BASE/soundtouchd-$V-linux-armv7
+curl -fsSLO $BASE/SHA256SUMS
+shasum -a 256 -c SHA256SUMS      # sha256sum -c on Linux
+```
+
+Builds are not bit-reproducible across hosts: rebuilding from source with the same Go
+version gives a functionally identical binary with a different hash. Use the release
+artifact if you want the checksum to match.
+
+To build it yourself instead:
 
 ```sh
 make armv7      # static armv7 binary -> dist/soundtouchd  (needs Go)
 make test vet   # unit tests + vet (host)
+make test-race  # race detector (host only; -race needs cgo)
 ```
+
+CI runs all of the above plus the armv7 cross-compile on every push and pull request.
+
+> **Note:** `make install` below builds from source. To deploy a *downloaded* binary,
+> copy it to `/tmp/soundtouchd-stage/` on the speaker as `soundtouchd`, alongside the
+> files from `packaging/`, and run `sh /tmp/soundtouchd-stage/install.sh` there.
 
 ## Setting up a brand-new device
 
