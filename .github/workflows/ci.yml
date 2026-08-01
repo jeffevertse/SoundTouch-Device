@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here writes to the repo; the armv7 build is the only output.
+permissions:
+  contents: read
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # go-version-file keeps CI on whatever go.mod asks for, so bumping the
+      # module's Go version doesn't silently leave CI behind.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Separate steps rather than one `make fmt vet test armv7`, so a failure
+      # names itself in the checks list instead of just "make".
+      - name: gofmt
+        run: make fmt
+
+      - name: vet
+        run: make vet
+
+      - name: test
+        run: make test
+
+      # The real deliverable: a static armv7 binary for the speaker. Catches
+      # anything that builds on the host but not for the target.
+      - name: armv7 cross-compile
+        run: make armv7
