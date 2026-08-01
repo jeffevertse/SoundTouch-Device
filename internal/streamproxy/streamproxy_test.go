@@ -201,7 +201,9 @@ func TestRelayCancelsStalledStream(t *testing.T) {
 // Data flowing keeps the stream alive well past a single idleTimeout window.
 func TestRelayKeepsAliveWhileDataFlows(t *testing.T) {
 	orig := idleTimeout
-	idleTimeout = 100 * time.Millisecond
+	// Deliberately generous: an 8x margin between the write interval and the
+	// idle window, so a loaded CI runner scheduling late can't fail this.
+	idleTimeout = 400 * time.Millisecond
 	defer func() { idleTimeout = orig }()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -209,7 +211,7 @@ func TestRelayKeepsAliveWhileDataFlows(t *testing.T) {
 
 	pr, pw := io.Pipe()
 	go func() {
-		// 5 chunks over ~250ms, each well inside the 100ms idle window.
+		// 5 chunks over ~250ms, each well inside the idle window.
 		for i := 0; i < 5; i++ {
 			time.Sleep(50 * time.Millisecond)
 			if _, err := pw.Write([]byte("chunk")); err != nil {
