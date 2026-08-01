@@ -2,7 +2,7 @@ VERSION ?= 0.5.0
 SSHOPT  := -o HostKeyAlgorithms=+ssh-rsa
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build test vet armv7 backup run-tmp install uninstall clean
+.PHONY: build test fmt vet armv7 backup run-tmp install uninstall clean
 
 ## Local host build (for development on the Mac)
 build:
@@ -11,7 +11,14 @@ build:
 test:
 	go test ./...
 
-vet:
+## Fail if anything is not gofmt-formatted (run `gofmt -w .` to fix)
+fmt:
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		echo "not gofmt-formatted:"; echo "$$unformatted"; exit 1; \
+	fi
+
+vet: fmt
 	go vet ./...
 
 ## Cross-compile the static armv7 binary for the speaker

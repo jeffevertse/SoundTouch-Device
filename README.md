@@ -137,6 +137,11 @@ Mutating endpoints (`POST /config`, `POST /bass`, `POST /restart`) require
 in the config to also require `Authorization: Bearer <token>` on those endpoints — empty
 (the default) means no auth, which keeps the iOS companion app working unchanged.
 
+`GET /play/<id>` and `GET /stream/<id>` can't use that guard (they're GETs), so they reject
+requests a browser labels cross-site — a public page can't start playback with a hidden
+`<img src="http://<speaker-ip>:8099/play/1">`. Non-browser clients (curl, the iOS app, the
+speaker's own renderer) send no such labelling and are unaffected.
+
 ```sh
 # play a preset
 curl http://<speaker-ip>:8099/play/1     # BBC Radio 4
@@ -164,6 +169,7 @@ changing `proxy_port`.
 Because the editor is served by the daemon itself it is same-origin with the API — no CORS
 involved. CORS for other tools is restricted to localhost/private-network origins (`Origin: null`
 is deliberately rejected), so a public website can't reach your speaker through your browser.
+It applies to every endpoint, so a LAN dashboard can read `/status` and `/healthz` too.
 
 ### Editing stations (SSH)
 

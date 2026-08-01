@@ -11,6 +11,7 @@
 package streamproxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -20,12 +21,21 @@ import (
 	"time"
 )
 
+// idleTimeout bounds how long the proxy waits for the next byte of audio. A
+// stalled upstream (TCP connection alive, no data flowing) would otherwise hold
+// the request open until TCP keepalive gives up — minutes, during which it also
+// holds one of the caller's concurrency slots. Radio streams deliver
+// continuously, so a gap this long always means the stream is dead.
+//
+// A var, not a const, so tests can shorten it.
+var idleTimeout = 20 * time.Second
+
 // privateNets are ranges a public stream URL must never resolve to.
 var privateNets = func() []*net.IPNet {
 	cidrs := []string{
 		"0.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 		"127.0.0.0/8", "169.254.0.0/16", // link-local + cloud metadata
-		"100.64.0.0/10",                // CGNAT
+		"100.64.0.0/10",                 // CGNAT
 		"192.0.0.0/24", "198.18.0.0/15", // IETF protocol assignments + benchmarking
 		"224.0.0.0/4", "240.0.0.0/4", // multicast + reserved
 		"::1/128", "fc00::/7", "fe80::/10",
@@ -139,7 +149,7 @@ func looksLikePlaylistCT(ct string) bool {
 // safeGet performs a DNS-rebinding-safe HTTP request: downgrade to HTTP, resolve
 // the host once, reject private targets, and connect to that pinned IP while
 // preserving the original Host header. Redirects are not followed.
-func safeGet(method, raw string, timeout time.Duration) (*http.Response, error) {
+func safeGet(ctx context.Context, method, raw string, timeout time.Duration) (*http.Response, error) {
 	raw = downgrade(raw)
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -163,7 +173,7 @@ func safeGet(method, raw string, timeout time.Duration) (*http.Response, error) 
 	pinned := *u
 	pinned.Host = net.JoinHostPort(ip, port)
 
-	req, err := http.NewRequest(method, pinned.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, method, pinned.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -201,9 +211,9 @@ func resolveLocation(base, loc string) string {
 
 // follow performs safeGet and chases up to maxRedirects redirect hops.
 // It returns the final response and the URL it came from.
-func follow(method, raw string, timeout time.Duration) (*http.Response, string, error) {
+func follow(ctx context.Context, method, raw string, timeout time.Duration) (*http.Response, string, error) {
 	for hop := 0; ; hop++ {
-		resp, err := safeGet(method, raw, timeout)
+		resp, err := safeGet(ctx, method, raw, timeout)
 		if err != nil {
 			return nil, "", err
 		}
@@ -218,14 +228,14 @@ func follow(method, raw string, timeout time.Duration) (*http.Response, string, 
 
 // Resolve turns a configured station URL into a direct HTTP stream URL,
 // downgrading HTTPS and resolving PLS/M3U playlists.
-func Resolve(raw string) (string, error) {
+func Resolve(ctx context.Context, raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("empty URL")
 	}
 	raw = downgrade(raw)
 	isPlaylist := looksLikePlaylistExt(raw)
 	if !isPlaylist {
-		if head, final, err := follow(http.MethodHead, raw, 5*time.Second); err == nil {
+		if head, final, err := follow(ctx, http.MethodHead, raw, 5*time.Second); err == nil {
 			ct := head.Header.Get("Content-Type")
 			head.Body.Close()
 			raw = final
@@ -235,7 +245,7 @@ func Resolve(raw string) (string, error) {
 	if !isPlaylist {
 		return raw, nil
 	}
-	resp, _, err := follow(http.MethodGet, raw, 10*time.Second)
+	resp, _, err := follow(ctx, http.MethodGet, raw, 10*time.Second)
 	if err != nil {
 		return raw, nil // fall back to original on fetch failure
 	}
@@ -257,8 +267,9 @@ func isRedirect(code int) bool {
 
 // openStream opens a long-lived HTTP GET for audio streaming. Unlike safeGet,
 // the http.Client has no overall Timeout so the body can be read indefinitely;
-// connection and header deadlines are enforced at the transport level.
-func openStream(raw string) (*http.Response, error) {
+// connection and header deadlines are enforced at the transport level, and ctx
+// tears the connection down when the client goes away or the stream stalls.
+func openStream(ctx context.Context, raw string) (*http.Response, error) {
 	raw = downgrade(raw)
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -282,7 +293,7 @@ func openStream(raw string) (*http.Response, error) {
 	pinned := *u
 	pinned.Host = net.JoinHostPort(ip, port)
 
-	req, err := http.NewRequest(http.MethodGet, pinned.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pinned.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -305,13 +316,20 @@ func openStream(raw string) (*http.Response, error) {
 }
 
 // Proxy streams the resolved station to w as clean audio (no ICY metadata).
-func Proxy(w http.ResponseWriter, stationURL string) {
-	direct, err := Resolve(stationURL)
+// The upstream fetch is tied to r's context, so it is torn down as soon as the
+// renderer disconnects rather than lingering on a socket nobody is reading.
+func Proxy(w http.ResponseWriter, r *http.Request, stationURL string) {
+	// Derived from the request context so both a client disconnect and the
+	// stall watchdog below abort the upstream read.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	direct, err := Resolve(ctx, stationURL)
 	if err != nil {
 		http.Error(w, "no stream", http.StatusNotFound)
 		return
 	}
-	resp, err := openStream(direct)
+	resp, err := openStream(ctx, direct)
 	if err != nil {
 		http.Error(w, "stream error", http.StatusBadGateway)
 		return
@@ -324,13 +342,27 @@ func Proxy(w http.ResponseWriter, stationURL string) {
 			return
 		}
 		direct = resolveLocation(direct, loc)
-		resp, err = openStream(direct)
+		resp, err = openStream(ctx, direct)
 		if err != nil {
 			http.Error(w, "stream error", http.StatusBadGateway)
 			return
 		}
 	}
 	defer resp.Body.Close()
+
+	relay(w, resp, cancel)
+}
+
+// relay validates an upstream response and copies its body to w as clean audio,
+// calling cancel if the stream falls silent for idleTimeout. Split out from
+// Proxy so it can be tested without a live upstream.
+func relay(w http.ResponseWriter, resp *http.Response, cancel context.CancelFunc) {
+	// Don't hand the renderer an error page as if it were audio. This also
+	// catches a redirect chain that outran maxRedirects.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		http.Error(w, "upstream returned "+resp.Status, http.StatusBadGateway)
+		return
+	}
 
 	ct := resp.Header.Get("Content-Type")
 	if ct == "" {
@@ -339,11 +371,19 @@ func Proxy(w http.ResponseWriter, stationURL string) {
 	w.Header().Set("Content-Type", ct)
 	// Intentionally do not forward icy-* headers: we don't request metadata, so
 	// the body is clean audio and the renderer must not expect interleaved metadata.
+
+	// Cancel the fetch if the stream goes quiet for idleTimeout; every chunk of
+	// audio pushes the deadline out again. Cancelling aborts the in-flight
+	// Read below, which is what frees the connection and the caller's slot.
+	stall := time.AfterFunc(idleTimeout, cancel)
+	defer stall.Stop()
+
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 8192)
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			stall.Reset(idleTimeout)
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return
 			}

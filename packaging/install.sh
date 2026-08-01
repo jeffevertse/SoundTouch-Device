@@ -44,13 +44,23 @@ chmod +x /etc/init.d/$APP
 update-rc.d $APP defaults 2>/dev/null || true
 
 # Keep only the newest backup to protect the small /mnt/nv partition.
-ls -t "$INSTALL_DIR/$APP".*.backup 2>/dev/null | tail -n +2 | xargs -r rm -f
+# No `xargs -r` here: it's a GNU extension that BusyBox may not have, and under
+# `set -e` a failure would abort before the service is started below.
+ls -t "$INSTALL_DIR/$APP".*.backup 2>/dev/null | tail -n +2 | while read -r old; do
+    rm -f "$old"
+done
 
 /etc/init.d/$APP restart 2>/dev/null || /etc/init.d/$APP start
 sleep 2
 
 echo "[install] disk after:"; df -h /mnt/nv 2>/dev/null || df -h
-echo "[install] health:"
-curl -fsS --max-time 5 "http://127.0.0.1:8099/healthz" || echo "(health check failed — see /tmp/$APP.log)"
+
+# Health-check the port the config actually uses, not a hardcoded 8099.
+PORT=$(sed -n 's/.*"proxy_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$INSTALL_DIR/config.json" 2>/dev/null | head -n 1)
+[ -n "$PORT" ] || PORT=8099
+
+echo "[install] health (port $PORT):"
+curl -fsS --max-time 5 "http://127.0.0.1:$PORT/healthz" || echo "(health check failed — see /tmp/$APP.log)"
 echo
 echo "[install] done. Uninstall with uninstall.sh."

@@ -27,9 +27,9 @@ var presetIDRe = regexp.MustCompile(`nowSelectionUpdated[\s\S]*?<preset[^>]*\bid
 
 // Watcher reacts to power-on (onResume) and physical preset presses (onPreset).
 type Watcher struct {
-	client     *client.Client
-	onResume   func()
-	onPreset   func(int)
+	client      *client.Client
+	onResume    func()
+	onPreset    func(int)
 	mu          sync.Mutex
 	prev        string
 	wentStandby time.Time
