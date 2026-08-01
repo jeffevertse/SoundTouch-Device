@@ -38,7 +38,22 @@ jobs:
       - name: test
         run: make test
 
+      # Run separately from `test` so a data race is distinguishable from an
+      # ordinary failure. Host-only: -race needs cgo, so it can't run for armv7.
+      - name: test (race detector)
+        run: make test-race
+
       # The real deliverable: a static armv7 binary for the speaker. Catches
       # anything that builds on the host but not for the target.
       - name: armv7 cross-compile
         run: make armv7
+
+      # Keep the exact binary each commit produced, so what gets deployed to the
+      # speaker is traceable to a commit rather than rebuilt from a dirty tree.
+      - name: upload armv7 binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: soundtouchd-armv7-${{ github.sha }}
+          path: dist/soundtouchd
+          if-no-files-found: error
+          retention-days: 30

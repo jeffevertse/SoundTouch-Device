@@ -2,7 +2,7 @@ VERSION ?= 0.6.0
 SSHOPT  := -o HostKeyAlgorithms=+ssh-rsa
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build test fmt vet armv7 backup run-tmp install uninstall clean
+.PHONY: build test test-race fmt vet armv7 backup run-tmp install uninstall clean
 
 ## Local host build (for development on the Mac)
 build:
@@ -10,6 +10,12 @@ build:
 
 test:
 	go test ./...
+
+## Race detector. Needs cgo, so it only runs on the host — never for armv7.
+## The daemon is heavily concurrent (config store, atomic player pointer,
+## stall watchdog vs. the copy loop), which is exactly what this catches.
+test-race:
+	go test -race ./...
 
 ## Fail if anything is not gofmt-formatted (run `gofmt -w .` to fix)
 fmt:
