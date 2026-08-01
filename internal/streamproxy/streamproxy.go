@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -257,6 +258,70 @@ func Resolve(ctx context.Context, raw string) (string, error) {
 	return raw, nil
 }
 
+// resolveTTL bounds how long a resolved stream URL is reused. Resolution costs
+// a HEAD, and for a playlist a further GET, before the first byte of audio —
+// which is the whole perceived latency of a preset button press. Kept short
+// because stations do rotate their edge URLs; a failed open also drops the
+// entry immediately rather than waiting the TTL out.
+const resolveTTL = 10 * time.Minute
+
+type cacheEntry struct {
+	direct string
+	at     time.Time
+}
+
+// Keyed by the configured station URL. Bounded in practice by the 6 presets:
+// only a configured station can reach the proxy, so this cannot grow without
+// limit.
+var (
+	resolveMu    sync.Mutex
+	resolveCache = map[string]cacheEntry{}
+)
+
+// cachedResolve is Resolve with a short-lived memo in front of it.
+func cachedResolve(ctx context.Context, station string) (string, error) {
+	resolveMu.Lock()
+	e, ok := resolveCache[station]
+	resolveMu.Unlock()
+	if ok && time.Since(e.at) < resolveTTL {
+		return e.direct, nil
+	}
+
+	// Resolve outside the lock: it does network I/O, and holding the mutex
+	// would serialise every stream request behind one slow station.
+	direct, err := Resolve(ctx, station)
+	if err != nil {
+		return "", err
+	}
+	resolveMu.Lock()
+	resolveCache[station] = cacheEntry{direct: direct, at: time.Now()}
+	resolveMu.Unlock()
+	return direct, nil
+}
+
+// dropCached forgets one station's resolution, so the next request resolves
+// afresh. Called when a cached URL turns out not to work.
+func dropCached(station string) {
+	resolveMu.Lock()
+	delete(resolveCache, station)
+	resolveMu.Unlock()
+}
+
+// InvalidateCache clears every memoised resolution. Call it when the station
+// list changes, so an edited preset takes effect immediately instead of after
+// the TTL.
+func InvalidateCache() {
+	resolveMu.Lock()
+	clear(resolveCache)
+	resolveMu.Unlock()
+}
+
+// streamable reports whether an upstream status carries a body we should relay
+// as audio.
+func streamable(code int) bool {
+	return code == http.StatusOK || code == http.StatusPartialContent
+}
+
 func isRedirect(code int) bool {
 	switch code {
 	case 301, 302, 303, 307, 308:
@@ -324,42 +389,67 @@ func Proxy(w http.ResponseWriter, r *http.Request, stationURL string) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	direct, err := Resolve(ctx, stationURL)
-	if err != nil {
-		http.Error(w, "no stream", http.StatusNotFound)
-		return
+	resp, err := openResolved(ctx, stationURL, true)
+	if err != nil && ctx.Err() == nil {
+		// The memoised URL can go stale — stations rotate edges, and a dead one
+		// would otherwise keep failing for the rest of the TTL. Drop it and try
+		// once more against a freshly resolved URL. Skipped when the context is
+		// already done, since that failure is our own client leaving.
+		dropCached(stationURL)
+		resp, err = openResolved(ctx, stationURL, false)
 	}
-	resp, err := openStream(ctx, direct)
 	if err != nil {
 		http.Error(w, "stream error", http.StatusBadGateway)
 		return
-	}
-	for hop := 0; isRedirect(resp.StatusCode) && hop < maxRedirects; hop++ {
-		loc := resp.Header.Get("Location")
-		resp.Body.Close()
-		if loc == "" {
-			http.Error(w, "stream error", http.StatusBadGateway)
-			return
-		}
-		direct = resolveLocation(direct, loc)
-		resp, err = openStream(ctx, direct)
-		if err != nil {
-			http.Error(w, "stream error", http.StatusBadGateway)
-			return
-		}
 	}
 	defer resp.Body.Close()
 
 	relay(w, resp, cancel)
 }
 
+// openResolved resolves a station to a direct URL and opens it, chasing
+// redirects. The returned response is always one worth relaying: any non-2xx
+// or transport failure comes back as an error instead, so the caller can decide
+// to re-resolve rather than pass an error page along as audio.
+func openResolved(ctx context.Context, station string, useCache bool) (*http.Response, error) {
+	resolve := Resolve
+	if useCache {
+		resolve = cachedResolve
+	}
+	direct, err := resolve(ctx, station)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := openStream(ctx, direct)
+	if err != nil {
+		return nil, err
+	}
+	for hop := 0; isRedirect(resp.StatusCode) && hop < maxRedirects; hop++ {
+		loc := resp.Header.Get("Location")
+		resp.Body.Close()
+		if loc == "" {
+			return nil, fmt.Errorf("redirect with no Location")
+		}
+		direct = resolveLocation(direct, loc)
+		if resp, err = openStream(ctx, direct); err != nil {
+			return nil, err
+		}
+	}
+	if !streamable(resp.StatusCode) {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned %s", resp.Status)
+	}
+	return resp, nil
+}
+
 // relay validates an upstream response and copies its body to w as clean audio,
 // calling cancel if the stream falls silent for idleTimeout. Split out from
 // Proxy so it can be tested without a live upstream.
 func relay(w http.ResponseWriter, resp *http.Response, cancel context.CancelFunc) {
-	// Don't hand the renderer an error page as if it were audio. This also
-	// catches a redirect chain that outran maxRedirects.
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+	// Don't hand the renderer an error page as if it were audio. Proxy already
+	// rejects these in openResolved; this keeps the guarantee a property of
+	// relay itself rather than of one caller.
+	if !streamable(resp.StatusCode) {
 		http.Error(w, "upstream returned "+resp.Status, http.StatusBadGateway)
 		return
 	}
