@@ -50,10 +50,15 @@ jobs:
 
       # Keep the exact binary each commit produced, so what gets deployed to the
       # speaker is traceable to a commit rather than rebuilt from a dirty tree.
+      #
+      # head.sha, not github.sha: on a pull_request event github.sha is the
+      # ephemeral merge commit, which doesn't exist in the repo — naming the
+      # artifact after it would defeat the point. Falls back to github.sha on
+      # push, where it is the real commit.
       - name: upload armv7 binary
         uses: actions/upload-artifact@v7
         with:
-          name: soundtouchd-armv7-${{ github.sha }}
+          name: soundtouchd-armv7-${{ github.event.pull_request.head.sha || github.sha }}
           path: dist/soundtouchd
           if-no-files-found: error
           retention-days: 30
