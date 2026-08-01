@@ -73,7 +73,7 @@ func (s *configStore) SetLastPreset(id int) {
 
 // Replace validates, persists, and swaps in a new config.
 func (s *configStore) Replace(c *presets.Config) error {
-	if err := validateConfig(c); err != nil {
+	if err := presets.Validate(c); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -82,30 +82,6 @@ func (s *configStore) Replace(c *presets.Config) error {
 		return err
 	}
 	s.cfg = c
-	return nil
-}
-
-func validateConfig(c *presets.Config) error {
-	if c == nil {
-		return fmt.Errorf("nil config")
-	}
-	if c.ProxyPort < 1 || c.ProxyPort > 65535 {
-		return fmt.Errorf("proxy_port %d out of range", c.ProxyPort)
-	}
-	if len(c.Presets) == 0 {
-		return fmt.Errorf("no presets")
-	}
-	for _, p := range c.Presets {
-		if p.ID < 1 || p.ID > 6 {
-			return fmt.Errorf("preset id %d out of range (1-6)", p.ID)
-		}
-		if p.StreamURL != "" {
-			u, err := url.Parse(p.StreamURL)
-			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-				return fmt.Errorf("preset %d: stream_url must be an http(s) URL", p.ID)
-			}
-		}
-	}
 	return nil
 }
 
@@ -186,13 +162,11 @@ func main() {
 		}
 	}()
 
-	// Point the physical preset buttons at this daemon. Retry until all
-	// StorePreset calls succeed (transient errors possible right after boot).
-	go func() {
-		for !syncHardwarePresets(st, store.Get(), streamBase) {
-			time.Sleep(5 * time.Second)
-		}
-	}()
+	// Point the physical preset buttons at this daemon. Retry with backoff for
+	// transient errors right after boot, but give up eventually: a permanently
+	// rejected preset would otherwise hammer the device API and grow the log
+	// forever, on a device with a very small writable partition.
+	go retryPresetSync(st, store.Get, streamBase)
 
 	var playMu sync.Mutex
 	playPreset := func(id int) error {
@@ -231,6 +205,13 @@ func main() {
 	// this keeps a misbehaving LAN client from exhausting the device's RAM.
 	streamSem := make(chan struct{}, 4)
 	mux.HandleFunc("/stream/", func(w http.ResponseWriter, r *http.Request) {
+		// Same guard as /play, here to stop a drive-by page from parking <audio>
+		// elements on us and eating the slots below. The speaker's own renderer
+		// is not a browser and sends no Fetch-Metadata headers.
+		if !sameSiteOK(r) {
+			http.Error(w, "cross-site request rejected", http.StatusForbidden)
+			return
+		}
 		id, ok := idFromPath(r.URL.Path, "/stream/")
 		p := store.Get().ByID(id)
 		if !ok || p == nil || p.StreamURL == "" {
@@ -244,10 +225,19 @@ func main() {
 			http.Error(w, "too many concurrent streams", http.StatusServiceUnavailable)
 			return
 		}
-		streamproxy.Proxy(w, p.StreamURL)
+		streamproxy.Proxy(w, r, p.StreamURL)
 	})
 
 	mux.HandleFunc("/play/", func(w http.ResponseWriter, r *http.Request) {
+		// /play is a GET (the iOS app and curl rely on that), so it can't use the
+		// JSON Content-Type guard the POST endpoints do. Fetch-Metadata is the
+		// equivalent for a GET: it stops a public page from starting playback with
+		// an <img src=…/play/1>, while non-browser clients send no such headers
+		// and are unaffected.
+		if !sameSiteOK(r) {
+			http.Error(w, "cross-site request rejected", http.StatusForbidden)
+			return
+		}
 		id, ok := idFromPath(r.URL.Path, "/play/")
 		if !ok {
 			http.Error(w, "bad preset id", http.StatusBadRequest)
@@ -275,10 +265,7 @@ func main() {
 
 	// ── config editor API (used by editor/config-editor.html) ───────────────
 	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
-		cors(w, r)
 		switch r.Method {
-		case http.MethodOptions:
-			w.WriteHeader(http.StatusNoContent)
 		case http.MethodGet:
 			// Never expose the token; shallow copy is safe (scalar field only).
 			c := *store.Get()
@@ -311,10 +298,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/bass", func(w http.ResponseWriter, r *http.Request) {
-		cors(w, r)
 		switch r.Method {
-		case http.MethodOptions:
-			w.WriteHeader(http.StatusNoContent)
 		case http.MethodGet:
 			b, err := st.GetBass()
 			if err != nil {
@@ -337,19 +321,18 @@ func main() {
 				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
-			log.Printf("[soundtouchd] bass set to %d", req.Level)
-			writeJSON(w, map[string]any{"ok": true, "level": req.Level})
+			// SetBassSafe clamps to the device's range; report what actually
+			// landed, not what was asked for, so the editor's slider can't drift
+			// out of sync with the speaker.
+			level := models.ClampBassLevel(req.Level)
+			log.Printf("[soundtouchd] bass set to %d", level)
+			writeJSON(w, map[string]any{"ok": true, "level": level})
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 
 	mux.HandleFunc("/restart", func(w http.ResponseWriter, r *http.Request) {
-		cors(w, r)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -401,7 +384,7 @@ func main() {
 	// (unset) — /stream responses are unbounded audio.
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", listenPort),
-		Handler:           mux,
+		Handler:           withCORS(mux),
 		ReadHeaderTimeout: 10 * time.Second, // Slowloris guard
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -412,6 +395,35 @@ func main() {
 	}()
 
 	select {} // goroutines run forever; this keeps main alive
+}
+
+// Bounds on the preset-sync retry loop: ~8 minutes of attempts, which comfortably
+// covers a cold boot, then stop rather than retrying forever.
+const (
+	maxPresetSyncAttempts = 12
+	maxPresetSyncDelay    = 60 * time.Second
+)
+
+// retryPresetSync calls syncHardwarePresets until it succeeds, backing off from
+// 5s to maxPresetSyncDelay and giving up after maxPresetSyncAttempts. The next
+// config change triggers a fresh sync regardless.
+//
+// current is re-read every attempt rather than captured once, so a config saved
+// while we're still retrying is the one that lands in the hardware slots.
+func retryPresetSync(st *client.Client, current func() *presets.Config, streamBase string) {
+	delay := 5 * time.Second
+	for attempt := 1; ; attempt++ {
+		if syncHardwarePresets(st, current(), streamBase) {
+			return
+		}
+		if attempt >= maxPresetSyncAttempts {
+			log.Printf("[soundtouchd] hardware preset sync still failing after %d attempts — giving up "+
+				"(presets still work via /play and the config editor; save the config again to retry)", attempt)
+			return
+		}
+		time.Sleep(delay)
+		delay = min(2*delay, maxPresetSyncDelay)
+	}
 }
 
 // syncHardwarePresets writes the configured stations into the speaker's 6 physical
@@ -433,7 +445,7 @@ func syncHardwarePresets(st *client.Client, cfg *presets.Config, streamBase stri
 			ItemName:     p.Name,
 		}
 		if err := st.StorePreset(p.ID, ci); err != nil {
-			log.Printf("[soundtouchd] storePreset %d: %v — will retry", p.ID, err)
+			log.Printf("[soundtouchd] storePreset %d: %v", p.ID, err)
 			ok = false
 		}
 	}
@@ -456,6 +468,38 @@ func cors(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	}
+}
+
+// withCORS applies cors to every endpoint and answers preflight uniformly.
+// Doing this once in middleware rather than per handler is what keeps /status
+// and /healthz reachable from a LAN dashboard — they were previously left out.
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cors(w, r)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sameSiteOK reports whether a request may perform a side effect via GET.
+// Browsers label every request with Sec-Fetch-Site; "cross-site" means some
+// other page triggered it, which for /play or /stream is never legitimate.
+// Non-browser clients (curl, the iOS app, the speaker's own renderer) send
+// neither header and are always allowed.
+func sameSiteOK(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "same-site", "none":
+		// "none" is a user-initiated load: address bar, bookmark, app.
+	default:
+		return false
+	}
+	if o := r.Header.Get("Origin"); o != "" && !isLocalOrigin(o) {
+		return false
+	}
+	return true
 }
 
 func isLocalOrigin(origin string) bool {
@@ -505,10 +549,13 @@ func localIP(peer string) string {
 		if err != nil {
 			continue
 		}
-		ip := conn.LocalAddr().(*net.UDPAddr).IP
+		addr, ok := conn.LocalAddr().(*net.UDPAddr)
 		conn.Close()
-		if ip != nil && !ip.IsLoopback() {
-			return ip.String()
+		if !ok {
+			continue // never expected for a udp dial; don't panic the daemon at boot
+		}
+		if addr.IP != nil && !addr.IP.IsLoopback() {
+			return addr.IP.String()
 		}
 	}
 	// No external route yet (early boot) — enumerate interfaces directly.

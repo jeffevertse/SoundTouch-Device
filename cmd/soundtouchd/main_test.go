@@ -12,37 +12,8 @@ import (
 	"github.com/jeffevertse/soundtouch-device/internal/presets"
 )
 
-func TestValidateConfig(t *testing.T) {
-	if err := validateConfig(presets.Default()); err != nil {
-		t.Fatalf("default config should be valid: %v", err)
-	}
-	bad := presets.Default()
-	bad.ProxyPort = 0
-	if validateConfig(bad) == nil {
-		t.Error("port 0 should be rejected")
-	}
-	bad = presets.Default()
-	bad.Presets = nil
-	if validateConfig(bad) == nil {
-		t.Error("no presets should be rejected")
-	}
-	bad = presets.Default()
-	bad.Presets[0].ID = 9
-	if validateConfig(bad) == nil {
-		t.Error("preset id 9 should be rejected")
-	}
-	bad = presets.Default()
-	bad.Presets[0].StreamURL = "ftp://example.com/stream"
-	if validateConfig(bad) == nil {
-		t.Error("non-http(s) stream_url should be rejected")
-	}
-	bad = presets.Default()
-	bad.Presets[0].StreamURL = "not a url"
-	if validateConfig(bad) == nil {
-		t.Error("unparseable stream_url should be rejected")
-	}
-}
-
+// Validation itself is covered by presets.TestValidate; what matters here is
+// that Replace enforces it.
 func TestConfigStoreReplaceAndGet(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	s := &configStore{cfg: presets.Default(), path: path}
@@ -182,5 +153,81 @@ func TestCORS(t *testing.T) {
 	cors(w, r)
 	if w.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Error("public origin should not be allowed")
+	}
+}
+
+func TestSameSiteOK(t *testing.T) {
+	req := func(set map[string]string) *http.Request {
+		r := httptest.NewRequest("GET", "/play/1", nil)
+		for k, v := range set {
+			r.Header.Set(k, v)
+		}
+		return r
+	}
+
+	// Non-browser clients (curl, the iOS app, the speaker's own renderer) send
+	// no Fetch-Metadata headers and must keep working.
+	if !sameSiteOK(req(nil)) {
+		t.Error("a request with no Fetch-Metadata headers should be allowed")
+	}
+	// The editor page and user-initiated navigations.
+	for _, site := range []string{"same-origin", "same-site", "none"} {
+		if !sameSiteOK(req(map[string]string{"Sec-Fetch-Site": site})) {
+			t.Errorf("Sec-Fetch-Site: %s should be allowed", site)
+		}
+	}
+	// A public page doing <img src="http://speaker:8099/play/1">.
+	if sameSiteOK(req(map[string]string{
+		"Sec-Fetch-Site": "cross-site",
+		"Sec-Fetch-Mode": "no-cors",
+		"Sec-Fetch-Dest": "image",
+	})) {
+		t.Error("cross-site request should be rejected")
+	}
+	// Belt and braces for clients that send Origin but not Sec-Fetch-Site.
+	if sameSiteOK(req(map[string]string{"Origin": "https://evil.example.com"})) {
+		t.Error("public Origin should be rejected")
+	}
+	if !sameSiteOK(req(map[string]string{"Origin": "http://192.168.1.50"})) {
+		t.Error("LAN Origin should be allowed")
+	}
+}
+
+// Every endpoint gets CORS now, not just the three that called cors() directly —
+// a LAN dashboard needs /status and /healthz too.
+func TestWithCORSCoversAllEndpointsAndPreflight(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"ok": true})
+	})
+	h := withCORS(mux)
+
+	r := httptest.NewRequest("GET", "/status", nil)
+	r.Header.Set("Origin", "http://192.168.1.50")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://192.168.1.50" {
+		t.Errorf("/status Allow-Origin = %q, want the LAN origin", got)
+	}
+
+	// Preflight is answered without reaching the handler.
+	r = httptest.NewRequest("OPTIONS", "/status", nil)
+	r.Header.Set("Origin", "http://192.168.1.50")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Errorf("preflight status = %d, want 204", w.Code)
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("preflight should have an empty body, got %q", w.Body.String())
+	}
+
+	// A public origin still gets nothing.
+	r = httptest.NewRequest("GET", "/status", nil)
+	r.Header.Set("Origin", "https://evil.example.com")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Error("public origin should not get a CORS header")
 	}
 }

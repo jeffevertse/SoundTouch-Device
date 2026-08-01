@@ -5,6 +5,9 @@ package presets
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 )
@@ -47,10 +50,48 @@ func Default() *Config {
 	}
 }
 
-// Load reads config from path. If the file is absent, corrupt, or empty it
-// falls back to path+".bak" (written by Save after every successful write)
-// and finally to Default(). This means a power-cut during Save never bricks
-// the daemon — it self-heals on the next boot.
+// Validate reports whether a config is safe to run with. A config that fails
+// here would either crash the daemon at startup (an unusable proxy_port) or
+// silently misbehave (a preset the speaker's 6 slots can't hold).
+func Validate(c *Config) error {
+	if c == nil {
+		return fmt.Errorf("nil config")
+	}
+	if c.ProxyPort < 1 || c.ProxyPort > 65535 {
+		return fmt.Errorf("proxy_port %d out of range", c.ProxyPort)
+	}
+	if len(c.Presets) == 0 {
+		return fmt.Errorf("no presets")
+	}
+	seen := make(map[int]bool, len(c.Presets))
+	for _, p := range c.Presets {
+		if p.ID < 1 || p.ID > 6 {
+			return fmt.Errorf("preset id %d out of range (1-6)", p.ID)
+		}
+		// Duplicates would silently shadow each other: ByID returns the first,
+		// but syncHardwarePresets writes every one into the same physical slot.
+		if seen[p.ID] {
+			return fmt.Errorf("duplicate preset id %d", p.ID)
+		}
+		seen[p.ID] = true
+		if p.StreamURL != "" {
+			u, err := url.Parse(p.StreamURL)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return fmt.Errorf("preset %d: stream_url must be an http(s) URL", p.ID)
+			}
+		}
+	}
+	return nil
+}
+
+// Load reads config from path. If the file is absent, corrupt, empty, or fails
+// Validate it falls back to path+".bak" (written by Save after every successful
+// write) and finally to Default(). This means neither a power-cut during Save
+// nor a bad hand-edit bricks the daemon — it self-heals on the next boot.
+//
+// Which candidate won is always logged: a silent fall back to Default() looks
+// exactly like "my presets vanished", and the next config write would persist
+// those defaults over the .bak that might still hold the real ones.
 func Load(path string) (*Config, error) {
 	for _, candidate := range []string{path, path + ".bak"} {
 		data, err := os.ReadFile(candidate)
@@ -58,17 +99,25 @@ func Load(path string) (*Config, error) {
 			continue
 		}
 		if err != nil {
+			log.Printf("[presets] %s unreadable (%v) — trying next candidate", candidate, err)
 			continue
 		}
 		var c Config
 		if err := json.Unmarshal(data, &c); err != nil {
-			continue // corrupt — try next candidate
+			log.Printf("[presets] %s is corrupt (%v) — trying next candidate", candidate, err)
+			continue
 		}
 		if c.ProxyPort == 0 {
 			c.ProxyPort = 8099
 		}
+		if err := Validate(&c); err != nil {
+			log.Printf("[presets] %s is invalid (%v) — trying next candidate", candidate, err)
+			continue
+		}
+		log.Printf("[presets] loaded config from %s (%d presets)", candidate, len(c.Presets))
 		return &c, nil
 	}
+	log.Printf("[presets] no usable config at %s or %s.bak — starting from defaults", path, path)
 	return Default(), nil
 }
 
