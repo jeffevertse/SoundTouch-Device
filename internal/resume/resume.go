@@ -5,6 +5,7 @@
 package resume
 
 import (
+	"context"
 	"log"
 	"regexp"
 	"strconv"
@@ -41,11 +42,11 @@ func New(c *client.Client, onResume func(), onPreset func(int)) *Watcher {
 	return &Watcher{client: c, onResume: onResume, onPreset: onPreset}
 }
 
-// Start connects to the WebSocket and blocks until ws.Wait() returns (i.e.
-// until the client is explicitly disconnected). The library handles reconnects
-// internally. Start returns a non-nil error only when the initial connect
-// fails (e.g. firmware WebSocket not ready yet at boot).
-func (w *Watcher) Start() error {
+// Start connects to the WebSocket and blocks until ctx is cancelled or the
+// client is disconnected. The library handles reconnects internally. Start
+// returns a non-nil error when the initial connect fails (e.g. firmware
+// WebSocket not ready yet at boot), or ctx.Err() after cancellation.
+func (w *Watcher) Start(ctx context.Context) error {
 	ws := w.client.NewWebSocketClient(client.DefaultWebSocketConfig())
 
 	// Power-on → resume last station.
@@ -108,7 +109,16 @@ func (w *Watcher) Start() error {
 	if err := ws.Connect(); err != nil {
 		return err // initial connect failed (firmware WebSocket not ready yet)
 	}
-	// Block here; the library's internal reconnect loop handles drops.
-	ws.Wait()
-	return nil
+	// Block here; the library's internal reconnect loop handles drops. Wait
+	// runs in its own goroutine because Disconnect is a no-op mid-reconnect,
+	// which would otherwise leave shutdown stuck behind it.
+	closed := make(chan struct{})
+	go func() { ws.Wait(); close(closed) }()
+	select {
+	case <-closed:
+		return nil
+	case <-ctx.Done():
+		_ = ws.Disconnect() // send a close frame rather than just vanishing
+		return ctx.Err()
+	}
 }

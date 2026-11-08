@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
@@ -14,11 +15,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gesellix/bose-soundtouch/pkg/client"
@@ -126,6 +130,10 @@ func main() {
 	log.Printf("[soundtouchd] %s | device=%s port=%d", version, deviceHost, listenPort)
 
 	st := client.NewClientFromHost(deviceHost)
+
+	// Cancelled on SIGTERM/SIGINT, once the handler is installed further down.
+	ctx, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
 
 	// Wait for the SoundTouch firmware HTTP API (port 8090) to be ready.
 	// soundtouchd starts before the firmware on cold boot; this is the single
@@ -383,7 +391,9 @@ func main() {
 
 	// Auto-resume on power-on + physical preset buttons. Retries on failure so
 	// a cold boot (firmware WebSocket not ready yet) self-heals.
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		watcher := resume.New(st, func() {
 			// Never wake a speaker that is actually off (guards a late/stale event).
 			if np, err := st.GetNowPlaying(); err == nil && strings.EqualFold(np.Source, "STANDBY") {
@@ -403,12 +413,16 @@ func main() {
 		for {
 			// Start blocks while connected; the library reconnects internally on
 			// drop. It only returns an error when the initial connect fails (firmware
-			// WebSocket not up yet at cold boot). Retry until the firmware is ready.
-			if err := watcher.Start(); err != nil {
-				log.Printf("[resume] websocket error: %v — retrying in 5s", err)
-				time.Sleep(5 * time.Second)
-			} else {
-				return // context cancelled / explicit disconnect — not expected in normal use
+			// WebSocket not up yet at cold boot) or we are shutting down.
+			err := watcher.Start(ctx)
+			if err == nil || ctx.Err() != nil {
+				return
+			}
+			log.Printf("[resume] websocket error: %v — retrying in 5s", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
 			}
 		}
 	}()
@@ -422,12 +436,65 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+
+	// Installed only now. Before this point nothing needs draining, and the
+	// default SIGTERM action (exit at once) is right for the startup waits
+	// above, which can otherwise block for a minute or more on a cold boot.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
-		log.Printf("[soundtouchd] listening on %s", srv.Addr)
-		log.Fatal(srv.ListenAndServe())
+		sig := <-sigc
+		log.Printf("[soundtouchd] %v: shutting down", sig)
+		signal.Reset(syscall.SIGTERM, syscall.SIGINT) // a second signal exits at once
+		shutdown()
 	}()
 
-	select {} // goroutines run forever; this keeps main alive
+	log.Printf("[soundtouchd] listening on %s", srv.Addr)
+	if err := serve(ctx, srv, ln, shutdownGrace); err != nil {
+		if ctx.Err() == nil {
+			log.Fatalf("serve: %v", err) // not a requested stop: exit non-zero
+		}
+		log.Printf("[soundtouchd] shutdown: %v", err)
+	}
+	// Give the WebSocket its close frame; don't let a stuck library hold us.
+	select {
+	case <-watcherDone:
+	case <-time.After(time.Second):
+	}
+	log.Printf("[soundtouchd] stopped")
+}
+
+// shutdownGrace bounds how long in-flight requests get to finish on SIGTERM.
+// It must stay below the init script's wait before it sends SIGKILL.
+const shutdownGrace = 5 * time.Second
+
+// serve runs srv on ln until ctx is cancelled, then shuts down gracefully: it
+// stops accepting connections, ends open audio streams, and lets short requests
+// finish (a /config save mid-write, a /play mid-UPnP call). Streams have to be
+// ended explicitly. They never go idle, so Shutdown alone would wait out the
+// whole grace period for them. Every request context is cancelled for that, but
+// only the stream proxy watches its context. Other handlers run to completion.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener, grace time.Duration) error {
+	reqCtx, endRequests := context.WithCancel(context.Background())
+	defer endRequests()
+	srv.BaseContext = func(net.Listener) context.Context { return reqCtx }
+	srv.RegisterOnShutdown(endRequests)
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	select {
+	case err := <-errc:
+		return err // the listener failed; Serve never returns nil
+	case <-ctx.Done():
+	}
+
+	sctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	return srv.Shutdown(sctx)
 }
 
 // Bounds on the preset-sync retry loop: ~8 minutes of attempts, which comfortably
