@@ -222,6 +222,7 @@ cmd/soundtouchd     entrypoint (HTTP proxy + control, UPnP, auto-resume, embedde
 internal/streamproxy  HTTPS→HTTP + playlist resolution + SSRF guard (tested)
 internal/presets      JSON config (tested)
 internal/upnp         AVTransport SetAVTransportURI + Play
+internal/hostaddr     picks the LAN address presets and the renderer use (tested)
 internal/resume       power-on detection via WebSocket
 packaging/            init script, install/uninstall (run on device)
 scripts/              backup.sh, deploy-tmp.sh (run from the Mac)

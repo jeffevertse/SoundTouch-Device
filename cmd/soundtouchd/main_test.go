@@ -231,3 +231,32 @@ func TestWithCORSCoversAllEndpointsAndPreflight(t *testing.T) {
 		t.Error("public origin should not get a CORS header")
 	}
 }
+
+// streamAddr is read by HTTP handlers and the preset sync while the address
+// watcher rewrites it; run under -race this proves the swap is safe.
+func TestStreamAddrConcurrentSwap(t *testing.T) {
+	a := &streamAddr{port: 8099}
+	a.set("203.0.113.1")
+	if got := a.base(); got != "http://203.0.113.1:8099" {
+		t.Fatalf("base = %q", got)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 1000; i++ {
+			a.set("192.168.1.29")
+			a.set("192.168.1.30")
+		}
+		close(done)
+	}()
+	for i := 0; i < 1000; i++ {
+		if b := a.base(); b != "http://192.168.1.29:8099" && b != "http://192.168.1.30:8099" && b != "http://203.0.113.1:8099" {
+			t.Fatalf("torn read: %q", b)
+		}
+	}
+	<-done
+	a.set("192.168.1.29")
+	if got := a.host(); got != "192.168.1.29" {
+		t.Errorf("host = %q after final set", got)
+	}
+}
