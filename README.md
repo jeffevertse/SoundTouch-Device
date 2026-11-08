@@ -33,7 +33,7 @@ prebuilt static armv7 binary, so you don't need Go to install this. The attached
 the one CI built for the tagged commit — the same bytes the checksum covers:
 
 ```sh
-V=v0.6.0
+V=v0.7.0
 BASE=https://github.com/jeffevertse/SoundTouch-Device/releases/download/$V
 curl -fsSLO $BASE/soundtouchd-$V-linux-armv7
 curl -fsSLO $BASE/SHA256SUMS
