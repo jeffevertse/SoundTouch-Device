@@ -2,7 +2,7 @@ VERSION ?= 0.7.0
 SSHOPT  := -o HostKeyAlgorithms=+ssh-rsa
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build test test-race fmt vet armv7 backup run-tmp install uninstall clean
+.PHONY: build test test-race fmt vet vulncheck armv7 backup run-tmp install uninstall clean
 
 ## Local host build (for development on the Mac)
 build:
@@ -26,6 +26,15 @@ fmt:
 
 vet: fmt
 	go vet ./...
+
+## Known-vulnerability scan of the armv7 build that ships to the speaker.
+## Pinned so results only change when the code, Go, or this pin changes.
+## Installed for the host first: `go run` under GOOS=linux GOARCH=arm would
+## build govulncheck itself for ARM and fail to execute it.
+GOVULNCHECK := golang.org/x/vuln/cmd/govulncheck@v1.9.0
+vulncheck:
+	GOBIN=$(CURDIR)/dist/tools go install $(GOVULNCHECK)
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 dist/tools/govulncheck ./...
 
 ## Cross-compile the static armv7 binary for the speaker
 armv7:
