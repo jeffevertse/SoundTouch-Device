@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+    <specVersion>
+        <major>1</major>
+        <minor>0</minor>
+    </specVersion>
+    <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+        <friendlyName>SoundTouch 20</friendlyName>
+        <qq:X_QPlay_SoftwareCapability xmlns:qq="http://www.tencent.com">QPlay:2</qq:X_QPlay_SoftwareCapability>
+        <manufacturer>Bose Corporation</manufacturer>
+        <manufacturerURL>http://www.bose.com</manufacturerURL>
+        <modelName>SoundTouch 20</modelName>
+        <modelNumber></modelNumber>
+        <modelDescription>Bose SoundTouch Wireless Streaming Audio Device</modelDescription>
+        <modelURL>http://www.bose.com</modelURL>
+        <serialNumber>A0B1C2D3E4F5</serialNumber>
+        <UDN>uuid:BO5EBO5E-F00D-F00D-FEED-A0B1C2D3E4F5</UDN>
+        <serviceList>
+            <service>
+                <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+                <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>
+                <SCPDURL>/Xml/AVTransport3.xml</SCPDURL>
+                <controlURL>/AVTransport/Control</controlURL>
+                <eventSubURL>/AVTransport/Event</eventSubURL>
+            </service>
+            <service>
+                <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+                <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
+                <SCPDURL>/Xml/ConnectionManager3.xml</SCPDURL>
+                <controlURL>/ConnectionManager/Control</controlURL>
+                <eventSubURL>/ConnectionManager/Event</eventSubURL>
+            </service>
+            <service>
+                <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+                <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>
+                <SCPDURL>/Xml/RenderingControl3.xml</SCPDURL>
+                <controlURL>/RenderingControl/Control</controlURL>
+                <eventSubURL>/RenderingControl/Event</eventSubURL>
+            </service>
+            <service>
+                <serviceType>urn:schemas-tencent-com:service:QPlay:2</serviceType>
+                <serviceId>urn:tencent-com:serviceId:QPlay</serviceId>
+                <controlURL>/QPlay/Control</controlURL>
+                <eventSubURL>/QPlay/Event</eventSubURL>
+                <SCPDURL>/Xml/QPlay.xml</SCPDURL>
+            </service>
+        </serviceList>
+    </device>
+</root>

@@ -50,20 +50,37 @@ type Player struct {
 	client     *http.Client
 }
 
-// FindControlURL locates the speaker's AVTransport control URL. It tries SSDP
-// first (the renderer advertises its description LOCATION), then falls back to
-// the known Bose description path derived from the deviceID.
+// FindControlURL locates the speaker's AVTransport control URL. It tries the
+// known Bose description path derived from the deviceID first, then the
+// description LOCATION the renderer advertises over SSDP.
 func FindControlURL(host, deviceID string) (string, error) {
+	return firstControlURL(candidates(host, deviceID, ssdpLocation), host)
+}
+
+// candidates lists the description URLs to try, in order. ssdp is injected so
+// the ordering can be tested without multicast.
+func candidates(host, deviceID string, ssdp func(host, deviceID string) (string, error)) []string {
 	var locs []string
 	// Prefer the deviceID-derived description: it is definitively THIS speaker
 	// (the network may have other UPnP renderers — TVs, other speakers).
 	if deviceID != "" {
-		locs = append(locs, fmt.Sprintf("http://%s:8091/XD/BO5EBO5E-F00D-F00D-FEED-%s.xml",
-			host, strings.ToUpper(deviceID)))
+		locs = append(locs, boseDescURL(host, deviceID))
 	}
-	if loc, err := ssdpLocation(host, deviceID); err == nil && loc != "" {
+	if loc, err := ssdp(host, deviceID); err == nil && loc != "" {
 		locs = append(locs, loc)
 	}
+	return locs
+}
+
+// boseDescURL is where SoundTouch firmware serves its UPnP device description.
+func boseDescURL(host, deviceID string) string {
+	return fmt.Sprintf("http://%s:8091/XD/BO5EBO5E-F00D-F00D-FEED-%s.xml",
+		host, strings.ToUpper(deviceID))
+}
+
+// firstControlURL returns the AVTransport control URL from the first
+// description in locs that has one.
+func firstControlURL(locs []string, host string) (string, error) {
 	var lastErr error
 	for _, loc := range locs {
 		ctrl, err := controlURLFromDesc(loc)
@@ -127,8 +144,6 @@ func ssdpLocation(host, deviceID string) (string, error) {
 		return "", err
 	}
 
-	local := host == "" || host == "127.0.0.1" || host == "localhost"
-	wantID := strings.ToUpper(deviceID)
 	_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
 	buf := make([]byte, 65535)
 	for {
@@ -136,19 +151,30 @@ func ssdpLocation(host, deviceID string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		payload := string(buf[:n])
-		if !local && from.IP.String() != host {
-			continue
-		}
-		if wantID != "" && !strings.Contains(strings.ToUpper(payload), wantID) {
-			continue // a different UPnP renderer on the network
-		}
-		for _, line := range strings.Split(payload, "\n") {
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "location:") {
-				return strings.TrimSpace(line[strings.Index(line, ":")+1:]), nil
-			}
+		if loc, ok := matchSSDP(string(buf[:n]), from.IP, host, deviceID); ok {
+			return loc, nil
 		}
 	}
+}
+
+// matchSSDP returns the LOCATION from an SSDP response if it came from the
+// speaker we are looking for. Every MediaRenderer on the LAN answers the same
+// M-SEARCH, so responses are filtered by source address (when host is remote)
+// and by deviceID (when set).
+func matchSSDP(payload string, from net.IP, host, deviceID string) (string, bool) {
+	local := host == "" || host == "127.0.0.1" || host == "localhost"
+	if !local && from.String() != host {
+		return "", false
+	}
+	if wantID := strings.ToUpper(deviceID); wantID != "" && !strings.Contains(strings.ToUpper(payload), wantID) {
+		return "", false // a different UPnP renderer on the network
+	}
+	for _, line := range strings.Split(payload, "\n") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "location:") {
+			return strings.TrimSpace(line[strings.Index(line, ":")+1:]), true
+		}
+	}
+	return "", false
 }
 
 func resolveRef(base, ref string) string {
