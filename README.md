@@ -50,9 +50,12 @@ To build it yourself instead:
 make armv7      # static armv7 binary -> dist/soundtouchd  (needs Go)
 make test vet   # unit tests + vet (host)
 make test-race  # race detector (host only; -race needs cgo)
+make vulncheck  # govulncheck against the armv7 build
 ```
 
 CI runs all of the above plus the armv7 cross-compile on every push and pull request.
+The vulnerability scan also runs weekly, since new Go advisories land against code that
+hasn't changed.
 
 > **Note:** `make install` below builds from source. To deploy a *downloaded* binary,
 > copy it to `/tmp/soundtouchd-stage/` on the speaker as `soundtouchd`, alongside the

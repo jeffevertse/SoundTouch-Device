@@ -1,0 +1,39 @@
+name: govulncheck
+
+# New Go vulnerabilities are published against code that hasn't changed: the
+# 0.6.0 build picked up 17 reachable standard-library vulnerabilities between
+# August and November with no commits at all. So besides push and PR, this
+# runs on a schedule — that is the trigger that would have caught them.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vulncheck-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Scans with the Go version go.mod pins, i.e. the standard library that
+      # actually ships in the binary.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Scans the linux/armv7 build (see the Makefile). Fails the run when a
+      # vulnerability is reachable from our code; the fix is usually bumping
+      # the go directive or a dependency, then redeploying.
+      - name: govulncheck
+        run: make vulncheck
