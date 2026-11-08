@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -258,5 +261,80 @@ func TestStreamAddrConcurrentSwap(t *testing.T) {
 	a.set("192.168.1.29")
 	if got := a.host(); got != "192.168.1.29" {
 		t.Errorf("host = %q after final set", got)
+	}
+}
+
+// SIGTERM must end open audio streams at once (they never go idle, so a plain
+// Shutdown would sit out the whole grace period), let a short request already
+// in flight finish, and stop accepting new connections.
+func TestServeGracefulShutdown(t *testing.T) {
+	streamEnded := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("audio"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // what streamproxy does via its upstream fetch
+		close(streamEnded)
+	})
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond) // e.g. a /config write in progress
+		w.Write([]byte("done"))
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "http://" + ln.Addr().String()
+	ctx, stop := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, &http.Server{Handler: mux}, ln, 5*time.Second) }()
+
+	stream, err := http.Get(base + "/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Body.Close()
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(stream.Body, buf); err != nil {
+		t.Fatalf("stream not flowing: %v", err)
+	}
+
+	slow := make(chan string, 1)
+	go func() {
+		resp, err := http.Get(base + "/slow")
+		if err != nil {
+			slow <- "error: " + err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		slow <- string(b)
+	}()
+	time.Sleep(100 * time.Millisecond) // /slow is now in its handler
+
+	start := time.Now()
+	stop()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("serve did not return; the open stream held up shutdown")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("shutdown took %v; streams should end immediately", d)
+	}
+	select {
+	case <-streamEnded:
+	default:
+		t.Error("stream handler still running after shutdown")
+	}
+	if got := <-slow; got != "done" {
+		t.Errorf("in-flight request: got %q, want it to complete", got)
+	}
+	if _, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second); err == nil {
+		t.Error("still accepting connections after shutdown")
 	}
 }
