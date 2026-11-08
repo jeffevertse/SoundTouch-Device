@@ -24,6 +24,7 @@ import (
 	"github.com/gesellix/bose-soundtouch/pkg/client"
 	"github.com/gesellix/bose-soundtouch/pkg/models"
 
+	"github.com/jeffevertse/soundtouch-device/internal/hostaddr"
 	"github.com/jeffevertse/soundtouch-device/internal/presets"
 	"github.com/jeffevertse/soundtouch-device/internal/resume"
 	"github.com/jeffevertse/soundtouch-device/internal/streamproxy"
@@ -128,8 +129,9 @@ func main() {
 
 	// Wait for the SoundTouch firmware HTTP API (port 8090) to be ready.
 	// soundtouchd starts before the firmware on cold boot; this is the single
-	// gate for everything that depends on the API. Network (DHCP) is also
-	// guaranteed to be up once GetDeviceInfo() succeeds over TCP.
+	// gate for everything that depends on the API. It says nothing about the
+	// LAN: the API answers on 127.0.0.1 before Wi-Fi has a DHCP lease, which is
+	// why the stream address is chosen separately below.
 	deviceID := ""
 	for {
 		if info, err := st.GetDeviceInfo(); err == nil {
@@ -141,32 +143,60 @@ func main() {
 		time.Sleep(5 * time.Second)
 	}
 
-	// Compute streamHost after the firmware gate: the network (DHCP) is now
-	// guaranteed up, so localIP returns the real LAN IP rather than 127.0.0.1.
-	streamHost := localIP(deviceHost)
-	streamBase := fmt.Sprintf("http://%s:%d", streamHost, listenPort)
-	log.Printf("[soundtouchd] proxy=%s", streamBase)
+	// The address the renderer and the hardware presets use to reach us. Prefer
+	// the default route's source address, waiting for DHCP if need be; see
+	// internal/hostaddr for why "first interface with an address" is wrong here.
+	finder := hostaddr.System()
+	ip, how := finder.Wait(deviceHost, addrWait, 2*time.Second)
+	addr := &streamAddr{port: listenPort}
+	addr.set(ip.String())
+	if how == hostaddr.ViaRoute {
+		log.Printf("[soundtouchd] proxy=%s", addr.base())
+	} else {
+		log.Printf("[soundtouchd] proxy=%s (%s: no default route after %s; will switch once the network is up)",
+			addr.base(), how, addrWait)
+	}
 
 	// Resolve the UPnP AVTransport control URL. Retry in case the renderer
 	// comes up slightly after the HTTP API. atomic.Pointer: written here,
-	// read by HTTP handlers on other goroutines.
+	// read by HTTP handlers on other goroutines. Re-run whenever the address
+	// changes, since the control URL is built on it.
 	var player atomic.Pointer[upnp.Player]
-	go func() {
+	discoverPlayer := func() {
 		for {
-			if url, err := upnp.FindControlURL(streamHost, deviceID); err == nil {
+			if url, err := upnp.FindControlURL(addr.host(), deviceID); err == nil {
 				player.Store(upnp.New(url))
 				log.Printf("[soundtouchd] AVTransport control URL: %s", url)
 				return
 			}
 			time.Sleep(5 * time.Second)
 		}
-	}()
+	}
+	go discoverPlayer()
 
 	// Point the physical preset buttons at this daemon. Retry with backoff for
 	// transient errors right after boot, but give up eventually: a permanently
 	// rejected preset would otherwise hammer the device API and grow the log
 	// forever, on a device with a very small writable partition.
-	go retryPresetSync(st, store.Get, streamBase)
+	go retryPresetSync(st, store.Get, addr.base)
+
+	// Follow the LAN address: a late DHCP lease after the startup wait, or the
+	// router handing out a new one. Only a route-derived address is acted on,
+	// so a Wi-Fi blip (no route for a moment) never flips us onto usb0.
+	go func() {
+		for {
+			time.Sleep(addrPoll)
+			ip, ok := finder.FromRoute(deviceHost)
+			if !ok || ip.String() == addr.host() {
+				continue
+			}
+			old := addr.host()
+			addr.set(ip.String())
+			log.Printf("[soundtouchd] LAN address %s -> %s; re-pointing presets and renderer", old, ip)
+			go discoverPlayer()
+			go retryPresetSync(st, store.Get, addr.base)
+		}
+	}()
 
 	var playMu sync.Mutex
 	playPreset := func(id int) error {
@@ -180,7 +210,7 @@ func main() {
 		}
 		playMu.Lock()
 		defer playMu.Unlock()
-		streamURL := fmt.Sprintf("%s/stream/%d", streamBase, id)
+		streamURL := fmt.Sprintf("%s/stream/%d", addr.base(), id)
 		if err := pl.Play(streamURL); err != nil {
 			return err
 		}
@@ -290,7 +320,7 @@ func main() {
 				return
 			}
 			log.Printf("[soundtouchd] config updated via API (%d presets)", len(c.Presets))
-			go syncHardwarePresets(st, &c, streamBase)
+			go syncHardwarePresets(st, &c, addr.base())
 			writeJSON(w, map[string]any{"ok": true, "restartNeeded": c.ProxyPort != listenPort})
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -410,10 +440,10 @@ const (
 //
 // current is re-read every attempt rather than captured once, so a config saved
 // while we're still retrying is the one that lands in the hardware slots.
-func retryPresetSync(st *client.Client, current func() *presets.Config, streamBase string) {
+func retryPresetSync(st *client.Client, current func() *presets.Config, streamBase func() string) {
 	delay := 5 * time.Second
 	for attempt := 1; ; attempt++ {
-		if syncHardwarePresets(st, current(), streamBase) {
+		if syncHardwarePresets(st, current(), streamBase()) {
 			return
 		}
 		if attempt >= maxPresetSyncAttempts {
@@ -540,44 +570,22 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// localIP returns this machine's outbound LAN IP (the address the renderer can
-// use to reach our stream proxy). Falls back to interface enumeration (works
-// when the external routing table is not yet populated at cold boot).
-func localIP(peer string) string {
-	for _, target := range []string{net.JoinHostPort(peer, "80"), "8.8.8.8:80"} {
-		conn, err := net.DialTimeout("udp", target, 2*time.Second)
-		if err != nil {
-			continue
-		}
-		addr, ok := conn.LocalAddr().(*net.UDPAddr)
-		conn.Close()
-		if !ok {
-			continue // never expected for a udp dial; don't panic the daemon at boot
-		}
-		if addr.IP != nil && !addr.IP.IsLoopback() {
-			return addr.IP.String()
-		}
-	}
-	// No external route yet (early boot) — enumerate interfaces directly.
-	if ifaces, err := net.Interfaces(); err == nil {
-		for _, iface := range ifaces {
-			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-				continue
-			}
-			addrs, _ := iface.Addrs()
-			for _, addr := range addrs {
-				var ip net.IP
-				switch v := addr.(type) {
-				case *net.IPNet:
-					ip = v.IP
-				case *net.IPAddr:
-					ip = v.IP
-				}
-				if ip4 := ip.To4(); ip4 != nil {
-					return ip4.String()
-				}
-			}
-		}
-	}
-	return "127.0.0.1"
+// How long startup waits for a default route before settling for a fallback
+// address, and how often the address is re-checked afterwards. The wait is
+// only an optimisation — the watcher corrects a fallback later either way —
+// but it saves rewriting all six hardware presets twice on a normal boot.
+const (
+	addrWait = 60 * time.Second
+	addrPoll = 30 * time.Second
+)
+
+// streamAddr is the host the renderer and hardware presets use to reach us.
+// Read by HTTP handlers and the preset sync, rewritten by the address watcher.
+type streamAddr struct {
+	port int
+	h    atomic.Pointer[string]
 }
+
+func (a *streamAddr) set(host string) { a.h.Store(&host) }
+func (a *streamAddr) host() string    { return *a.h.Load() }
+func (a *streamAddr) base() string    { return fmt.Sprintf("http://%s:%d", a.host(), a.port) }
