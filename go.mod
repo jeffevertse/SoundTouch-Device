@@ -1,6 +1,6 @@
 module github.com/jeffevertse/soundtouch-device
 
-go 1.26.4
+go 1.26.10
 
 require github.com/gesellix/bose-soundtouch v0.112.0
 
